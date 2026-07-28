@@ -110,7 +110,6 @@ def load_pending_despatch_tasks():
     sheet = wb[SHEET_NAME]
     pending_tasks = []
     
-    # 14-day date threshold for sheet scan
     two_weeks_ago = datetime.now() - timedelta(days=14)
 
     for row_idx in range(2, sheet.max_row + 1):
@@ -130,7 +129,6 @@ def load_pending_despatch_tasks():
             if task_date < two_weeks_ago:
                 continue
 
-        # Column S (19): Cell Fill Color check. ONLY ORANGE = Complete.
         cell_address = sheet.cell(row=row_idx, column=19)
         fill = cell_address.fill
         is_orange = False
@@ -139,7 +137,6 @@ def load_pending_despatch_tasks():
             if any(c in cell_color for c in ["A500", "9900", "FFC000", "ED7D31", "F290"]):
                 is_orange = True
 
-        # Blue, White, Green, etc. treated as PENDING
         if not is_orange:
             address = cell_address.value
             company = sheet.cell(row=row_idx, column=17).value
@@ -155,7 +152,7 @@ def load_pending_despatch_tasks():
                     "kpi_status": kpi_status,
                     "kpi_badge_html": badge_html,
                     "is_red_overdue": is_red,
-                    "pic_name": str(sheet.cell(row=row_idx, column=5).value or "-"),     # Column E: Our Company PIC
+                    "pic_name": str(sheet.cell(row=row_idx, column=5).value or "-"),
                     "task_type": str(sheet.cell(row=row_idx, column=6).value or "Despatch"),
                     "area": str(sheet.cell(row=row_idx, column=14).value or "Unassigned"),
                     "box": float(sheet.cell(row=row_idx, column=16).value or 0),
@@ -168,13 +165,13 @@ def load_pending_despatch_tasks():
                     "transport": str(sheet.cell(row=row_idx, column=27).value or "Motorcycle"),
                     "sheet_time_slot": str(sheet.cell(row=row_idx, column=28).value or "").strip(),
                     "department": str(sheet.cell(row=row_idx, column=37).value or "-"),
-                    "client": str(sheet.cell(row=row_idx, column=38).value or "N/A"),     # Column AL: Client Name
+                    "client": str(sheet.cell(row=row_idx, column=38).value or "N/A"),
                     "phone": str(sheet.cell(row=row_idx, column=39).value or ""),
                 })
     return pending_tasks
 
 
-# --- 4. GOOGLE SHEETS WRITEBACK (MARK ORANGE) ---
+# --- 4. GOOGLE SHEETS WRITEBACK (WITH OFFLINE ERROR CATCHING) ---
 def mark_row_completed_in_sheets(row_idx):
     if "gcp_service_account" not in st.secrets:
         return False
@@ -188,16 +185,18 @@ def mark_row_completed_in_sheets(row_idx):
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.worksheet(SHEET_NAME)
         
-        # Paint row Orange (#FFA500)
         fmt = cellFormat(backgroundColor=color(1.0, 0.65, 0.0))
         format_cell_range(worksheet, f"A{row_idx}:AM{row_idx}", fmt)
         return True
+    except requests.exceptions.RequestException:
+        st.error("📡 Network error: No internet connection. Please check your signal and try clicking again.")
+        return False
     except Exception as e:
         st.error(f"Error updating Google Sheet: {e}")
         return False
 
 
-# --- 5. LOCATION SCORING & ROUTE OPTIMIZATION ---
+# --- 5. LOCATION SCORING & SPOKE-STYLE NEAREST NEIGHBOR TSP ROUTING ---
 def get_location_score(address):
     addr = str(address).lower()
     if "bertam" in addr or "serdang" in addr or "kepala batas" in addr: return 0
@@ -221,26 +220,36 @@ def optimize_route(stops_list, start_key, end_key):
     start_score = PRESET_LOCATIONS.get(start_key, {}).get("score", 120)
     end_score = PRESET_LOCATIONS.get(end_key, {}).get("score", 120)
 
-    def get_sort_key(item):
-        custom_t = item.get("custom_time")
-        overdue_priority = 0 if item.get("is_red_overdue") else 1
-        item_score = get_location_score(item["address"])
-        
-        # Determine routing direction based on start & end scores
-        if start_score == end_score:
-            route_score = abs(item_score - start_score)
-        elif start_score < end_score:
-            route_score = item_score
-        else:
-            route_score = -item_score
+    for s in stops_list:
+        s["score"] = get_location_score(s["address"])
 
-        if custom_t is not None:
-            time_val = custom_t.hour * 60 + custom_t.minute
-            return (overdue_priority, 0, time_val, route_score)
-        else:
-            return (overdue_priority, 1, 0, route_score)
-            
-    return sorted(stops_list, key=get_sort_key)
+    # Overdue and fixed-time stops take precedence
+    priority_stops = [s for s in stops_list if s.get("is_red_overdue") or s.get("custom_time")]
+    normal_stops = [s for s in stops_list if not s.get("is_red_overdue") and not s.get("custom_time")]
+
+    priority_stops.sort(key=lambda x: (
+        0 if x.get("is_red_overdue") else 1, 
+        x.get("custom_time").hour * 60 + x.get("custom_time").minute if x.get("custom_time") else 0
+    ))
+
+    # Nearest Neighbor Chain calculation for smooth A -> B -> C -> D -> E progression
+    unvisited = list(normal_stops)
+    current_pos = start_score
+    optimized_normal = []
+
+    while unvisited:
+        best_next = min(
+            unvisited, 
+            key=lambda s: (
+                abs(s["score"] - current_pos), 
+                abs(s["score"] - end_score)
+            )
+        )
+        optimized_normal.append(best_next)
+        current_pos = best_next["score"]
+        unvisited.remove(best_next)
+
+    return priority_stops + optimized_normal
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
@@ -260,7 +269,6 @@ if st.session_state.page == "setup":
 
     df_tasks = pd.DataFrame(tasks)
     
-    # Area, Transport & KPI Filters
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
         selected_area = st.selectbox("📍 Filter Area:", ["All Areas"] + list(df_tasks["area"].unique()))
@@ -285,7 +293,6 @@ if st.session_state.page == "setup":
 
     selected_stops = []
     
-    # Render Task List
     for _, row in filtered_df.iterrows():
         row_dict = row.to_dict()
         
@@ -332,7 +339,6 @@ if st.session_state.page == "setup":
             selected_stops.append(row_dict)
         st.markdown("---")
 
-    # START & END POINT SELECTION BEFORE OPTIMIZING
     st.markdown("### 🗺️ Route Endpoints & Optimization")
     st.caption("Select your starting point and final destination for today's run:")
     
@@ -344,7 +350,6 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    # OPTIMIZE BUTTON
     if st.button("🚀 Optimize & Start Loop", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
@@ -354,11 +359,11 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            # Run optimization based on start and end point
             st.session_state.optimized_route = optimize_route(selected_stops, sel_start, sel_end)
             st.session_state.current_stop = 0
             st.session_state.page = "route"
             st.rerun()
+
 
 # --- 7. UI PAGE: ROUTE DISPLAY & EXECUTION ---
 elif st.session_state.page == "route":
@@ -366,7 +371,6 @@ elif st.session_state.page == "route":
     current_idx = st.session_state.current_stop
     stop = st.session_state.optimized_route[current_idx]
 
-    # TOP NAV BAR: STOP COUNTER + ROUTE SUMMARY
     col_nav_top, col_home = st.columns([0.75, 0.25])
     with col_nav_top:
         opt_time_str = st.session_state.optimization_time.strftime("%I:%M %p") if st.session_state.optimization_time else ""
@@ -381,13 +385,11 @@ elif st.session_state.page == "route":
 
     st.progress((current_idx) / total_stops)
     
-    # DISPLAY ROUTE ENDPOINTS
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
     st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
     st.markdown("---")
 
-    # Current Job Card Details
     transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
     
     st.title(f"{stop['company']}")
@@ -398,7 +400,6 @@ elif st.session_state.page == "route":
     st.markdown(f"🏢 **Dept:** {stop['department']} | 👤 **Kalyx PIC:** {stop['pic_name']}")
     st.markdown(f"📍 **Address:** {stop['address']}")
     
-    # Parcel Details
     items = []
     if stop["box"] > 0: items.append(f"📦 {int(stop['box'])} Box")
     if stop["container"] > 0: items.append(f"🗃️ {int(stop['container'])} Container")
@@ -407,7 +408,6 @@ elif st.session_state.page == "route":
     if items:
         st.info(" | ".join(items))
     
-    # Call & Navigation Buttons
     clean_phone = str(stop["phone"]).replace(" ", "").replace("-", "") if stop["phone"] else ""
     col_c1, col_c2 = st.columns(2)
     
@@ -430,14 +430,15 @@ elif st.session_state.page == "route":
     st.write("")
     st.write("")
 
-    # COMPLETE BUTTON
     if st.button("✅ Mark Complete & Show Next Job", type="primary", use_container_width=True):
         with st.spinner("Updating Google Sheets..."):
-            mark_row_completed_in_sheets(stop["id"])
-            st.session_state.current_stop += 1
-            if st.session_state.current_stop >= total_stops:
-                st.session_state.page = "finished"
-            st.rerun()
+            success = mark_row_completed_in_sheets(stop["id"])
+            if success:
+                st.session_state.current_stop += 1
+                if st.session_state.current_stop >= total_stops:
+                    st.session_state.page = "finished"
+                st.rerun()
+
 
 # --- 8. UI PAGE: SHIFT COMPLETED ---
 elif st.session_state.page == "finished":
