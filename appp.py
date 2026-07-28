@@ -189,11 +189,19 @@ if st.session_state.page == "setup":
 
     selected_stops = []
     
-    # Render Task List with Per-Job Time Slot Input
+    # Render Task List with Department, PIC Name, Parcel Counts & Time Slot Input
     for _, row in filtered_df.iterrows():
         row_dict = row.to_dict()
         
-        c_check, c_details, c_time = st.columns([0.1, 0.62, 0.28])
+        # Build document/parcel count string
+        items = []
+        if row["box"] > 0: items.append(f"📦 {int(row['box'])} Box")
+        if row["container"] > 0: items.append(f"🗃️ {int(row['container'])} Container")
+        if row["bag"] > 0: items.append(f"🛍️ {int(row['bag'])} Bag")
+        if row["envelope"] > 0: items.append(f"✉️ {int(row['envelope'])} Envelope")
+        items_str = " | ".join(items) if items else "No document details"
+
+        c_check, c_details, c_time = st.columns([0.08, 0.64, 0.28])
         
         with c_check:
             is_checked = st.checkbox("Select", key=f"chk_{row['id']}")
@@ -202,6 +210,8 @@ if st.session_state.page == "setup":
             transport_icon = "🚗" if "car" in str(row["transport"]).lower() else "🏍️"
             st.markdown(
                 f"**{row['company']}** {transport_icon} - *{row['task_type']}*<br>"
+                f"<small>🏢 <b>Dept:</b> {row['department']} | 👤 <b>PIC:</b> {row['client']}</small><br>"
+                f"<small>📄 <b>Items:</b> {items_str}</small><br>"
                 f"<small>📍 {row['address']}</small>", 
                 unsafe_allow_html=True
             )
