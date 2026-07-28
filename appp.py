@@ -17,6 +17,25 @@ SHEET_ID = "1YZgwm11scCWdiH5-9RxBVe3kEk9obfNtlH4frIYZGSg"
 SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 SHEET_NAME = "Despatch"
 
+# --- PRESET START & END LOCATIONS ---
+PRESET_LOCATIONS = {
+    "Kalyx Consultants Sdn Bhd (Office)": {
+        "label": "🏢 Kalyx Consultants Sdn Bhd (Office)",
+        "address": "Kalyx Consultants Sdn Bhd, Bukit Mertajam",
+        "score": 120
+    },
+    "Machang Bubok (Home)": {
+        "label": "🏠 Machang Bubok (Home)",
+        "address": "Machang Bubok, Bukit Mertajam",
+        "score": 140
+    },
+    "Taman Sri Serdang, Bertam (Home)": {
+        "label": "🏠 Taman Sri Serdang, Bertam (Home)",
+        "address": "Taman Sri Serdang, Bertam, Kepala Batas",
+        "score": 0
+    }
+}
+
 # --- 1. SESSION STATE MANAGEMENT ---
 if "page" not in st.session_state:
     st.session_state.page = "setup"
@@ -26,6 +45,11 @@ if "current_stop" not in st.session_state:
     st.session_state.current_stop = 0
 if "optimization_time" not in st.session_state:
     st.session_state.optimization_time = None
+if "start_point" not in st.session_state:
+    st.session_state.start_point = "Kalyx Consultants Sdn Bhd (Office)"
+if "end_point" not in st.session_state:
+    st.session_state.end_point = "Kalyx Consultants Sdn Bhd (Office)"
+
 
 # --- 2. KPI AGING CALCULATION LOGIC ---
 def calculate_kpi_status(raw_request_date):
@@ -74,6 +98,7 @@ def calculate_kpi_status(raw_request_date):
     formatted_req_str = req_dt.strftime("%d/%m/%Y %I:%M %p")
     return days_elapsed, status_key, badge_html, is_red, formatted_req_str
 
+
 # --- 3. DATA LOADING LOGIC ---
 @st.cache_data(ttl=30, show_spinner=False)
 def load_pending_despatch_tasks():
@@ -89,7 +114,6 @@ def load_pending_despatch_tasks():
     two_weeks_ago = datetime.now() - timedelta(days=14)
 
     for row_idx in range(2, sheet.max_row + 1):
-        # Column A: Requested Date
         cell_date = sheet.cell(row=row_idx, column=1).value
         task_date = None
         if isinstance(cell_date, datetime):
@@ -115,7 +139,7 @@ def load_pending_despatch_tasks():
             if any(c in cell_color for c in ["A500", "9900", "FFC000", "ED7D31", "F290"]):
                 is_orange = True
 
-        # Blue, White, Green, etc., are treated as PENDING
+        # Blue, White, Green, etc. treated as PENDING
         if not is_orange:
             address = cell_address.value
             company = sheet.cell(row=row_idx, column=17).value
@@ -149,6 +173,7 @@ def load_pending_despatch_tasks():
                 })
     return pending_tasks
 
+
 # --- 4. GOOGLE SHEETS WRITEBACK (MARK ORANGE) ---
 def mark_row_completed_in_sheets(row_idx):
     if "gcp_service_account" not in st.secrets:
@@ -171,10 +196,12 @@ def mark_row_completed_in_sheets(row_idx):
         st.error(f"Error updating Google Sheet: {e}")
         return False
 
-# --- 5. ROUTE OPTIMIZATION ALGORITHMS ---
-def get_directional_score(address):
+
+# --- 5. LOCATION SCORING & ROUTE OPTIMIZATION ---
+def get_location_score(address):
     addr = str(address).lower()
-    if "perai jaya" in addr: return 10
+    if "bertam" in addr or "serdang" in addr or "kepala batas" in addr: return 0
+    elif "perai jaya" in addr: return 10
     elif "pauh" in addr: return 20
     elif "seberang jaya" in addr or "todak" in addr: return 30
     elif "chain ferry" in addr: return 40
@@ -185,21 +212,33 @@ def get_directional_score(address):
     elif "teguh" in addr or "tinggi" in addr: return 90
     elif "bukit minyak" in addr: return 100
     elif "juru" in addr: return 110
-    elif "bukit kecil" in addr: return 120
+    elif "bukit kecil" in addr or "perda" in addr or "kalyx" in addr: return 120
     elif "maju jaya" in addr: return 130
-    else: return 140
+    elif "machang bubok" in addr or "macang bubok" in addr: return 140
+    else: return 100
 
-def optimize_route(stops_list, start_time):
-    # Sort overdue/older tasks higher, then apply custom time / location score
+def optimize_route(stops_list, start_key, end_key):
+    start_score = PRESET_LOCATIONS.get(start_key, {}).get("score", 120)
+    end_score = PRESET_LOCATIONS.get(end_key, {}).get("score", 120)
+
     def get_sort_key(item):
         custom_t = item.get("custom_time")
         overdue_priority = 0 if item.get("is_red_overdue") else 1
+        item_score = get_location_score(item["address"])
         
+        # Determine routing direction based on start & end scores
+        if start_score == end_score:
+            route_score = abs(item_score - start_score)
+        elif start_score < end_score:
+            route_score = item_score
+        else:
+            route_score = -item_score
+
         if custom_t is not None:
             time_val = custom_t.hour * 60 + custom_t.minute
-            return (overdue_priority, 0, time_val, get_directional_score(item["address"]))
+            return (overdue_priority, 0, time_val, route_score)
         else:
-            return (overdue_priority, 1, 0, get_directional_score(item["address"]))
+            return (overdue_priority, 1, 0, route_score)
             
     return sorted(stops_list, key=get_sort_key)
 
@@ -242,8 +281,7 @@ if st.session_state.page == "setup":
     elif selected_kpi == "✅ On Time Only":
         filtered_df = filtered_df[filtered_df["kpi_status"] == "On Time"]
 
-    st.markdown(f"### 📋 Pending Tasks ({len(filtered_df)} Available)")
-    st.caption("Select tasks for today's run. Tasks highlighted in red exceed the 2-day KPI threshold:")
+    st.markdown(f"### 📋 Select Tasks for Today ({len(filtered_df)} Available)")
 
     selected_stops = []
     
@@ -251,7 +289,6 @@ if st.session_state.page == "setup":
     for _, row in filtered_df.iterrows():
         row_dict = row.to_dict()
         
-        # Build document/parcel count string
         items = []
         if row["box"] > 0: items.append(f"📦 {int(row['box'])} Box")
         if row["container"] > 0: items.append(f"🗃️ {int(row['container'])} Container")
@@ -259,7 +296,6 @@ if st.session_state.page == "setup":
         if row["envelope"] > 0: items.append(f"✉️ {int(row['envelope'])} Envelope")
         items_str = " | ".join(items) if items else "No document details"
 
-        # Apply Red warning card formatting if overdue
         border_style = "border-left: 5px solid #FF4D4D; padding-left: 8px;" if row["is_red_overdue"] else ""
 
         c_check, c_details, c_time = st.columns([0.08, 0.64, 0.28])
@@ -281,7 +317,6 @@ if st.session_state.page == "setup":
             )
             
         with c_time:
-            # Per-job time slot input option
             has_time = st.checkbox("Set Time", key=f"time_chk_{row['id']}")
             job_time = None
             if has_time:
@@ -297,28 +332,41 @@ if st.session_state.page == "setup":
             selected_stops.append(row_dict)
         st.markdown("---")
 
+    # START & END POINT SELECTION BEFORE OPTIMIZING
+    st.markdown("### 🗺️ Route Endpoints & Optimization")
+    st.caption("Select your starting point and final destination for today's run:")
+    
+    col_sp, col_ep = st.columns(2)
+    options_keys = list(PRESET_LOCATIONS.keys())
+    
+    with col_sp:
+        sel_start = st.selectbox("🚩 Start Point:", options_keys, index=0, key="select_start_pt")
+    with col_ep:
+        sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
+
     # OPTIMIZE BUTTON
     if st.button("🚀 Optimize & Start Loop", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
-            # Capture real-time timestamp
             realtime_now = datetime.now()
             st.session_state.optimization_time = realtime_now
+            st.session_state.start_point = sel_start
+            st.session_state.end_point = sel_end
             
-            # Run optimization
-            st.session_state.optimized_route = optimize_route(selected_stops, realtime_now)
+            # Run optimization based on start and end point
+            st.session_state.optimized_route = optimize_route(selected_stops, sel_start, sel_end)
             st.session_state.current_stop = 0
             st.session_state.page = "route"
             st.rerun()
 
-# --- 7. UI PAGE: SINGLE ROUTE DISPLAY & SEQUENTIAL EXECUTION ---
+# --- 7. UI PAGE: ROUTE DISPLAY & EXECUTION ---
 elif st.session_state.page == "route":
     total_stops = len(st.session_state.optimized_route)
     current_idx = st.session_state.current_stop
     stop = st.session_state.optimized_route[current_idx]
 
-    # TOP NAV BAR: STOP COUNTER + HOME BUTTON
+    # TOP NAV BAR: STOP COUNTER + ROUTE SUMMARY
     col_nav_top, col_home = st.columns([0.75, 0.25])
     with col_nav_top:
         opt_time_str = st.session_state.optimization_time.strftime("%I:%M %p") if st.session_state.optimization_time else ""
@@ -332,14 +380,17 @@ elif st.session_state.page == "route":
             st.rerun()
 
     st.progress((current_idx) / total_stops)
+    
+    # DISPLAY ROUTE ENDPOINTS
+    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
+    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
+    st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
     st.markdown("---")
 
     # Current Job Card Details
     transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
     
     st.title(f"{stop['company']}")
-    
-    # KPI Badge & Details
     st.markdown(f"{stop['kpi_badge_html']}", unsafe_allow_html=True)
     time_badge = f"⏰ Slot: {stop['custom_time'].strftime('%I:%M %p')}" if stop.get("custom_time") else "⏰ Flexible / Anytime"
     st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge}")
@@ -379,13 +430,10 @@ elif st.session_state.page == "route":
     st.write("")
     st.write("")
 
-    # COMPLETE BUTTON -> MARKS ORANGE IN SHEETS & AUTO-SHOWS NEXT JOB
+    # COMPLETE BUTTON
     if st.button("✅ Mark Complete & Show Next Job", type="primary", use_container_width=True):
         with st.spinner("Updating Google Sheets..."):
-            # Paint row Orange in Google Sheets
             mark_row_completed_in_sheets(stop["id"])
-            
-            # Step to next job
             st.session_state.current_stop += 1
             if st.session_state.current_stop >= total_stops:
                 st.session_state.page = "finished"
