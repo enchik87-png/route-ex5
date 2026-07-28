@@ -1,315 +1,260 @@
-from datetime import datetime, timedelta
 import io
-import openpyxl
+from datetime import datetime, timedelta
 import pandas as pd
+import openpyxl
 import requests
 import streamlit as st
+import gspread
+from gspread_formatting import cellFormat, color, format_cell_range
+from oauth2client.service_account import ServiceAccountCredentials
 
 st.set_page_config(
-    page_title="Kalyx Despatch Route Planner", page_icon="🏍️", layout="centered"
+    page_title="Kalyx Despatch Terminal", page_icon="🏍️", layout="centered"
 )
 
-st.title("🏍️ Kalyx Despatch Route Optimizer")
-st.write(
-    "Fetching pending tasks (only Orange = Complete) from your Google Sheet"
-    " 'Despatch' for the past 1 week with full parcel & transport details!"
-)
+# Your Live Google Sheet Details
+SHEET_ID = "1YZgwm11scCWdiH5-9RxBVe3kEk9obfNtlH4frIYZGSg"
+SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
+SHEET_NAME = "Despatch"
 
-# Your live Google Sheet export URL
-SHEET_EXPORT_URL = "https://docs.google.com/spreadsheets/d/1YZgwm11scCWdiH5-9RxBVe3kEk9obfNtlH4frIYZGSg/export?format=xlsx"
+# --- 1. STATE MANAGEMENT ---
+# This controls the sequential step-by-step screens
+if "page" not in st.session_state:
+    st.session_state.page = "setup"
+if "optimized_route" not in st.session_state:
+    st.session_state.optimized_route = []
+if "current_stop" not in st.session_state:
+    st.session_state.current_stop = 0
 
-
-@st.cache_data(ttl=60)
+# --- 2. DATA LOADING LOGIC ---
+@st.cache_data(ttl=30, show_spinner=False)
 def load_pending_despatch_tasks():
-  response = requests.get(SHEET_EXPORT_URL)
-  if response.status_code != 200:
-    raise Exception("Failed to download Google Sheet. Check sharing permissions.")
+    response = requests.get(SHEET_EXPORT_URL)
+    if response.status_code != 200:
+        raise Exception("Failed to download Google Sheet.")
 
-  wb = openpyxl.load_workbook(io.BytesIO(response.content), data_only=True)
-  if "Despatch" not in wb.sheetnames:
-    raise Exception("Sheet named 'Despatch' not found in workbook.")
+    wb = openpyxl.load_workbook(io.BytesIO(response.content), data_only=True)
+    sheet = wb[SHEET_NAME]
+    pending_tasks = []
+    
+    # 7-day date threshold
+    one_week_ago = datetime.now() - timedelta(days=7)
 
-  sheet = wb["Despatch"]
-  pending_tasks = []
+    for row_idx in range(2, sheet.max_row + 1):
+        # Date filtering (Column A = 1)
+        cell_date = sheet.cell(row=row_idx, column=1).value
+        task_date = None
+        if isinstance(cell_date, datetime):
+            task_date = cell_date
+        elif isinstance(cell_date, str):
+            try:
+                task_date = pd.to_datetime(cell_date)
+            except:
+                pass
 
-  # Define date threshold: exactly 1 week (7 days) ago from today
-  today = datetime.now()
-  one_week_ago = today - timedelta(days=7)
+        if task_date:
+            if hasattr(task_date, "to_pydatetime"):
+                task_date = task_date.to_pydatetime()
+            if task_date < one_week_ago:
+                continue
 
-  # Start from row 2 (skipping header)
-  for row_idx in range(2, sheet.max_row + 1):
-    # 1. Check Date in Column A
-    cell_date = sheet.cell(row=row_idx, column=1).value
-    task_date = None
+        # Check Cell Fill Color (Column S = 19). ONLY ORANGE = Complete.
+        cell_address = sheet.cell(row=row_idx, column=19)
+        fill = cell_address.fill
+        is_orange = False
+        if fill and fill.start_color and fill.start_color.rgb:
+            cell_color = str(fill.start_color.rgb).upper()
+            if any(c in cell_color for c in ["A500", "9900", "FFC000", "ED7D31", "F290"]):
+                is_orange = True
 
-    if isinstance(cell_date, datetime):
-      task_date = cell_date
-    elif isinstance(cell_date, str):
-      try:
-        task_date = pd.to_datetime(cell_date)
-      except:
-        pass
+        # Blue, White, Blank, Green are treated as PENDING
+        if not is_orange:
+            address = cell_address.value
+            company = sheet.cell(row=row_idx, column=17).value
+            
+            if company and address and str(address).strip() != "nan":
+                pending_tasks.append({
+                    "id": row_idx,
+                    "job_name": str(sheet.cell(row=row_idx, column=5).value or "-"),
+                    "task_type": str(sheet.cell(row=row_idx, column=6).value or "Despatch"),
+                    "area": str(sheet.cell(row=row_idx, column=14).value or "Unassigned"),
+                    "box": float(sheet.cell(row=row_idx, column=16).value or 0),
+                    "company": str(company),
+                    "address": str(address),
+                    "target_date": str(sheet.cell(row=row_idx, column=23).value or "-")[:10],
+                    "container": float(sheet.cell(row=row_idx, column=24).value or 0),
+                    "bag": float(sheet.cell(row=row_idx, column=25).value or 0),
+                    "envelope": float(sheet.cell(row=row_idx, column=26).value or 0),
+                    "transport": str(sheet.cell(row=row_idx, column=27).value or "Motorcycle"),
+                    "department": str(sheet.cell(row=row_idx, column=37).value or "-"),
+                    "client": str(sheet.cell(row=row_idx, column=38).value or "N/A"),
+                    "phone": str(sheet.cell(row=row_idx, column=39).value or ""),
+                })
+    return pending_tasks
 
-    if task_date:
-      if hasattr(task_date, "to_pydatetime"):
-        task_date = task_date.to_pydatetime()
-      if task_date < one_week_ago:
-        continue  # Skip tasks older than 1 week
+# --- 3. GOOGLE SHEETS API WRITEBACK ---
+def mark_row_completed_in_sheets(row_idx):
+    """Connects to Google Sheets via Service Account and paints the row Orange."""
+    if "gcp_service_account" not in st.secrets:
+        st.warning("⚠️ No Google Service Account detected in Secrets! (Row completed locally but not on cloud).")
+        return False
+        
+    try:
+        credentials = ServiceAccountCredentials.from_json_keyfile_dict(
+            dict(st.secrets["gcp_service_account"]),
+            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        )
+        gc = gspread.authorize(credentials)
+        sh = gc.open_by_key(SHEET_ID)
+        worksheet = sh.worksheet(SHEET_NAME)
+        
+        # Mark Columns A to AM (1 to 39) with ORANGE color (#FFA500)
+        fmt = cellFormat(backgroundColor=color(1.0, 0.65, 0.0))
+        format_cell_range(worksheet, f"A{row_idx}:AM{row_idx}", fmt)
+        return True
+    except Exception as e:
+        st.error(f"Failed to update Google Sheet: {e}")
+        return False
 
-    # 2. Check Cell Fill in Column S (Address) for completion status (Only Orange = Complete)
-    cell_address = sheet.cell(row=row_idx, column=19)  # Column S
-    fill = cell_address.fill
-
-    is_orange = False
-    if fill and fill.start_color and fill.start_color.rgb:
-      color = str(fill.start_color.rgb).upper()
-      if any(c in color for c in ["A500", "9900", "FFC000", "ED7D31", "F290"]):
-        is_orange = True
-
-    # If NOT orange, it is pending
-    if not is_orange:
-      # Mapping columns requested:
-      # Col A: Date (handled above)
-      # Col E: Job request name (5)
-      # Col F: Task type - Collect / Send / Collect Send / List out (6)
-      # Col N: Area (14)
-      # Col P: Box qty (16)
-      # Col Q: Company (17)
-      # Col S: Address (19)
-      # Col W: Request to be complete date (23)
-      # Col X: Container qty (24)
-      # Col Y: Bag qty (25)
-      # Col Z: Envelope qty (26)
-      # Col AA: Transport mode - Car / Motorcycle (27)
-      # Col AK: Department (37 -> wait, AK is column 37? Let's check Excel index: A=1... Z=26, AA=27, AB=28... AK = 1+10 = 37? Let's verify: A(1) to Z(26), AA(27) AB(28) AC(29) AD(30) AE(31) AF(32) AG(33) AH(34) AI(35) AJ(36) AK(37).)
-      # Col AL: Client Name (38)
-      # Col AM: Phone Number (39)
-
-      job_name = sheet.cell(row=row_idx, column=5).value
-      task_type = sheet.cell(row=row_idx, column=6).value
-      area = sheet.cell(row=row_idx, column=14).value
-      box_qty = sheet.cell(row=row_idx, column=16).value
-      company = sheet.cell(row=row_idx, column=17).value
-      address = cell_address.value
-      target_date = sheet.cell(row=row_idx, column=23).value
-      container_qty = sheet.cell(row=row_idx, column=24).value
-      bag_qty = sheet.cell(row=row_idx, column=25).value
-      env_qty = sheet.cell(row=row_idx, column=26).value
-      transport_mode = sheet.cell(row=row_idx, column=27).value
-      department = sheet.cell(row=row_idx, column=37).value
-      client = sheet.cell(row=row_idx, column=38).value
-      phone = sheet.cell(row=row_idx, column=39).value
-
-      if company and address and str(address).strip() != "nan":
-        pending_tasks.append({
-            "id": row_idx,
-            "job_name": str(job_name) if job_name else "-",
-            "task_type": str(task_type) if task_type else "Despatch",
-            "area": str(area) if area else "Unassigned",
-            "company": str(company),
-            "address": str(address),
-            "box": box_qty if box_qty else 0,
-            "container": container_qty if container_qty else 0,
-            "bag": bag_qty if bag_qty else 0,
-            "envelope": env_qty if env_qty else 0,
-            "transport": str(transport_mode) if transport_mode else "Motorcycle",
-            "target_date": str(target_date)[:10] if target_date else "-",
-            "department": str(department) if department else "-",
-            "client": str(client) if client else "N/A",
-            "phone": str(phone) if phone else "",
-            "date": (
-                task_date.strftime("%Y-%m-%d") if task_date else "Unknown"
-            ),
-        })
-
-  return pending_tasks
-
-
-try:
-  tasks = load_pending_despatch_tasks()
-except Exception as e:
-  st.error(f"Error loading sheet: {e}")
-  st.stop()
-
-if not tasks:
-  st.success(
-      "🎉 All tasks from the past week are completed (only orange rows found)!"
-  )
-  st.stop()
-
-df_tasks = pd.DataFrame(tasks)
-
-# Filters
-col_f1, col_f2 = st.columns(2)
-with col_f1:
-  selected_area = st.selectbox(
-      "📍 Filter by Area:",
-      options=["All Areas"] + list(df_tasks["area"].unique()),
-  )
-with col_f2:
-  selected_transport = st.selectbox(
-      "🚗/🏍️ Filter Transport Mode:",
-      options=["All", "Car", "Motorcycle"],
-  )
-
-filtered_df = df_tasks
-if selected_area != "All Areas":
-  filtered_df = filtered_df[filtered_df["area"] == selected_area]
-if selected_transport != "All":
-  filtered_df = filtered_df[
-      filtered_df["transport"].str.contains(
-          selected_transport, case=False, na=False
-      )
-  ]
-
-st.markdown(
-    f"### 📋 Pending Stops for the Past Week ({len(filtered_df)} available)"
-)
-
-selected_stops = []
-for idx, row in filtered_df.iterrows():
-  # Build item summary string
-  items = []
-  if row["box"] and float(row["box"]) > 0:
-    items.append(f"📦 {row['box']} Box(es)")
-  if row["container"] and float(row["container"]) > 0:
-    items.append(f"🗃️ {row['container']} Container(s)")
-  if row["bag"] and float(row["bag"]) > 0:
-    items.append(f"🛍️ {row['bag']} Bag(s)")
-  if row["envelope"] and float(row["envelope"]) > 0:
-    items.append(f"✉️ {row['envelope']} Envelope(s)")
-  item_str = " | ".join(items) if items else "No items specified"
-
-  col1, col2 = st.columns([0.1, 0.9])
-  with col1:
-    is_checked = st.checkbox(
-        "Select", key=f"chk_{row['id']}", label_visibility="collapsed"
-    )
-  with col2:
-    transport_icon = (
-        "🚗" if "car" in str(row["transport"]).lower() else "🏍️"
-    )
-    st.markdown(
-        f"**{row['company']}** ({row['task_type']}) {transport_icon}<br><small>🏷️"
-        f" Job: {row['job_name']} | 🏢 Dept: {row['department']}<br>📦"
-        f" {item_str}<br>📅 Target Date: {row['target_date']} | 📍"
-        f" {row['address']} | 📞 {row['client']} ({row['phone']})</small>",
-        unsafe_allow_html=True,
-    )
-  if is_checked:
-    selected_stops.append(row)
-
-start_point = st.text_input(
-    "Start Point Address:", "10-G, Jalan Icon City, 14000 Bukit Mertajam, Penang"
-)
-end_point = st.text_input(
-    "End Point Address:", "Machang Bubok, Bukit Mertajam, Pulau Pinang"
-)
-
-
+# --- 4. OPTIMIZATION LOGIC ---
 def smart_directional_sort(stops_list):
-  def get_directional_score(address):
-    addr = str(address).lower()
-    if "perai jaya" in addr:
-      return 10
-    elif "pauh" in addr:
-      return 20
-    elif "todak" in addr or "seberang jaya" in addr:
-      return 30
-    elif "chain ferry" in addr:
-      return 40
-    elif "teras jaya" in addr:
-      return 50
-    elif "ong yi how" in addr or "teratai" in addr:
-      return 52
-    elif "selayang" in addr:
-      return 60
-    elif "sungai dua" in addr or "kampung teluk" in addr:
-      return 70
-    elif "valdor" in addr or "sungai jawi" in addr:
-      return 80
-    elif "hijauan hills" in addr or "simpang ampat" in addr:
-      return 85
-    elif "teguh" in addr or "permatang tinggi" in addr:
-      return 90
-    elif "bukit minyak" in addr:
-      return 100
-    elif "juru" in addr or "simpang juru" in addr:
-      return 110
-    elif "bukit kecil" in addr:
-      return 120
-    elif "maju jaya" in addr:
-      return 130
-    elif "taman seri maju" in addr or "jalan maju" in addr:
-      return 135
-    else:
-      return 140
+    def get_directional_score(address):
+        addr = str(address).lower()
+        if "perai jaya" in addr: return 10
+        elif "pauh" in addr: return 20
+        elif "seberang jaya" in addr or "todak" in addr: return 30
+        elif "chain ferry" in addr: return 40
+        elif "ong yi how" in addr or "teras" in addr: return 50
+        elif "selayang" in addr or "sungai dua" in addr: return 60
+        elif "jawi" in addr or "valdor" in addr: return 80
+        elif "simpang ampat" in addr or "hijauan hills" in addr: return 85
+        elif "teguh" in addr or "tinggi" in addr: return 90
+        elif "bukit minyak" in addr: return 100
+        elif "juru" in addr: return 110
+        elif "bukit kecil" in addr: return 120
+        elif "maju jaya" in addr: return 130
+        else: return 140
+    return sorted(stops_list, key=lambda x: get_directional_score(x["address"]))
 
-  return sorted(stops_list, key=lambda x: get_directional_score(x["address"]))
+# --- 5. UI: SETUP PAGE ---
+if st.session_state.page == "setup":
+    st.title("🏍️ Kalyx Route Setup")
+    
+    with st.spinner("Fetching pending jobs from Google Sheets..."):
+        try:
+            tasks = load_pending_despatch_tasks()
+        except Exception as e:
+            st.error(f"Error loading sheet: {e}")
+            st.stop()
 
+    if not tasks:
+        st.success("🎉 All recent tasks are completed!")
+        st.stop()
 
-if st.button("🚀 Optimize Selected Route Loop", type="primary"):
-  if not selected_stops:
-    st.warning("Please check at least one stop above to generate your route.")
-  else:
-    optimized_stops = smart_directional_sort(selected_stops)
+    df_tasks = pd.DataFrame(tasks)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_area = st.selectbox("📍 Filter Area:", ["All Areas"] + list(df_tasks["area"].unique()))
+    with col2:
+        selected_transport = st.selectbox("🚗/🏍️ Transport:", ["All", "Car", "Motorcycle"])
+        
+    # Input Time in UI overriding sheet!
+    shift_time = st.time_input("⏰ Select Target Shift Time (Optional):")
+    st.session_state.shift_time_input = shift_time.strftime("%I:%M %p")
 
-    st.success(
-        f"Route successfully optimized for {len(optimized_stops)} selected"
-        " stops!"
-    )
+    filtered_df = df_tasks
+    if selected_area != "All Areas":
+        filtered_df = filtered_df[filtered_df["area"] == selected_area]
+    if selected_transport != "All":
+        filtered_df = filtered_df[filtered_df["transport"].str.contains(selected_transport, case=False)]
 
-    st.markdown("### 🛑 START POINT")
-    st.info(f"**Address:** {start_point}")
-    start_map = f"https://www.google.com/maps/dir/?api=1&destination={start_point.replace(' ', '+')}"
-    st.markdown(f"[🗺️ Navigate to Start Point]({start_map})")
+    st.markdown(f"### 📋 Select Stops for Current Run ({len(filtered_df)} Available)")
+    
+    selected_stops = []
+    for _, row in filtered_df.iterrows():
+        c_check, c_text = st.columns([0.1, 0.9])
+        with c_check:
+            is_checked = st.checkbox("Select", key=f"chk_{row['id']}")
+        with c_text:
+            transport_icon = "🚗" if "car" in str(row["transport"]).lower() else "🏍️"
+            st.markdown(f"**{row['company']}** {transport_icon} - {row['task_type']} <br><small>📍 {row['address']}</small>", unsafe_allow_html=True)
+        if is_checked:
+            selected_stops.append(row.to_dict())
+
+    if st.button("🚀 Optimize & Start Loop", type="primary", use_container_width=True):
+        if not selected_stops:
+            st.warning("Please select at least one stop.")
+        else:
+            st.session_state.optimized_route = smart_directional_sort(selected_stops)
+            st.session_state.current_stop = 0
+            st.session_state.page = "route"
+            st.rerun()
+
+# --- 6. UI: SINGLE STOP SEQUENTIAL NAVIGATION ---
+elif st.session_state.page == "route":
+    total_stops = len(st.session_state.optimized_route)
+    current_idx = st.session_state.current_stop
+    stop = st.session_state.optimized_route[current_idx]
+
+    # Header / Progress
+    st.progress((current_idx) / total_stops)
+    st.markdown(f"<h3 style='text-align: center; color: #ff6b6b;'>🏁 Stop {current_idx + 1} of {total_stops}</h3>", unsafe_allow_html=True)
     st.markdown("---")
 
-    st.markdown("### 🛑 OPTIMIZED STOPS")
-
-    for idx, stop in enumerate(optimized_stops, 1):
-      transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
-      with st.container():
-        st.markdown(
-            f"**Stop {idx}: {stop['company']}** — *{stop['task_type']}* "
-            f"{transport_icon} <small>(Target: {stop['target_date']})</small>"
-        )
-        st.write(
-            f"🏷️ **Job:** {stop['job_name']} | 🏢 **Dept:**"
-            f" {stop['department']}"
-        )
-        st.write(f"📍 **Address:** {stop['address']}")
-
-        items = []
-        if stop["box"] and float(stop["box"]) > 0:
-          items.append(f"📦 {stop['box']} Box(es)")
-        if stop["container"] and float(stop["container"]) > 0:
-          items.append(f"🗃️ {stop['container']} Container(s)")
-        if stop["bag"] and float(stop["bag"]) > 0:
-          items.append(f"🛍️ {stop['bag']} Bag(s)")
-        if stop["envelope"] and float(stop["envelope"]) > 0:
-          items.append(f"✉️ {stop['envelope']} Envelope(s)")
-        if items:
-          st.info(" | ".join(items))
-
-        clean_phone = (
-            str(stop["phone"]).replace(" ", "").replace("-", "")
-            if stop["phone"]
-            else ""
-        )
+    # Stop Details Card
+    transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
+    
+    st.title(f"{stop['company']}")
+    st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | **Target:** {st.session_state.shift_time_input} | **Dept:** {stop['department']}")
+    st.markdown(f"📍 **Address:** {stop['address']}")
+    
+    # Parcel Logic
+    items = []
+    if stop["box"] > 0: items.append(f"📦 {int(stop['box'])} Box")
+    if stop["container"] > 0: items.append(f"🗃️ {int(stop['container'])} Container")
+    if stop["bag"] > 0: items.append(f"🛍️ {int(stop['bag'])} Bag")
+    if stop["envelope"] > 0: items.append(f"✉️ {int(stop['envelope'])} Envelope")
+    if items:
+        st.info(" | ".join(items))
+    
+    # Contact & Navigation Buttons
+    clean_phone = str(stop["phone"]).replace(" ", "").replace("-", "") if stop["phone"] else ""
+    col_nav1, col_nav2 = st.columns(2)
+    
+    with col_nav1:
         if clean_phone and clean_phone != "nan":
-          st.markdown(
-              f"📞 **Contact:** {stop['client']} — [Call"
-              f" {stop['phone']}](tel:{clean_phone})"
-          )
+            st.markdown(f"<a href='tel:{clean_phone}'><button style='width: 100%; padding:15px; border-radius:8px; border:1px solid #1E90FF; background:transparent; color:#1E90FF;'>📞 Call {stop['client']}</button></a>", unsafe_allow_html=True)
         else:
-          st.markdown(f"📞 **Contact:** {stop['client']} (No phone)")
-
+            st.write(f"📞 Contact: {stop['client']} (No phone)")
+            
+    with col_nav2:
         maps_url = f"https://www.google.com/maps/dir/?api=1&destination={stop['address'].replace(' ', '+')}"
-        st.markdown(f"[🗺️ Navigate From Current Location]({maps_url})")
-        st.markdown("---")
+        st.markdown(f"<a href='{maps_url}' target='_blank'><button style='width: 100%; padding:15px; border-radius:8px; border:1px solid #28a745; background:transparent; color:#28a745;'>🗺️ Google Maps</button></a>", unsafe_allow_html=True)
+    
+    st.write("")
+    st.write("")
 
-    st.markdown("### 🏁 END POINT")
-    st.info(f"**Address:** {end_point}")
-    end_map = f"https://www.google.com/maps/dir/?api=1&destination={end_point.replace(' ', '+')}"
-    st.markdown(f"[🗺️ Navigate to End Point]({end_map})")
+    # Mark Complete Button (Advances to next sequence)
+    if st.button("✅ Mark Complete & Load Next Job", type="primary", use_container_width=True):
+        with st.spinner("Writing to Google Sheets..."):
+            # Call API to mark orange
+            mark_row_completed_in_sheets(stop["id"])
+            
+            # Auto-advance
+            st.session_state.current_stop += 1
+            if st.session_state.current_stop >= total_stops:
+                st.session_state.page = "finished"
+            st.rerun()
+
+# --- 7. UI: FINISHED SHIFT ---
+elif st.session_state.page == "finished":
+    st.balloons()
+    st.title("🎉 Route Complete!")
+    st.success("All selected jobs have been delivered, and Google Sheets is automatically updated.")
+    
+    if st.button("🔄 Start New Shift", use_container_width=True):
+        st.session_state.page = "setup"
+        # Reset cache so it pulls the newly orange-painted rows as complete
+        st.cache_data.clear() 
+        st.rerun()
