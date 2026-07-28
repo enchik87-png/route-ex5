@@ -6,11 +6,10 @@ st.set_page_config(
 
 st.title("🏍️ EX5 Dynamic Route Optimizer")
 st.write(
-    "Paste your raw list of stops below. The app will break them down into"
-    " individual stops with live auto-navigation links!"
+    "Smart-sequenced for motorcycle traffic flow (outbound primary lane ➔"
+    " farthest point ➔ inbound return lane)."
 )
 
-# Text area for raw paste
 raw_data = st.text_area(
     "Paste Raw Details Here:",
     height=200,
@@ -27,43 +26,106 @@ end_point = st.text_input(
     "End Point Address:", "Machang Bubok, Bukit Mertajam, Pulau Pinang"
 )
 
-if st.button("🚀 Process & Generate Route Cards", type="primary"):
+
+def smart_directional_sort(stops_list):
+  """Sorts stops to ensure smooth directional flow (outbound vs inbound lanes)
+
+  preventing unnecessary mid-road crossings or U-turns.
+  """
+
+  def get_directional_score(address):
+    addr = address.lower()
+
+    # Phase 1: Outbound Northern / Western Sweep (Left-lane biased)
+    if "perai jaya" in addr:
+      return 10
+    elif "pauh" in addr:
+      return 20
+    elif "todak" in addr or "seberang jaya" in addr:
+      return 30
+    elif "chain ferry" in addr:
+      return 40
+
+    # Phase 2: Butterworth Loop (Ong Yi How / Teras Jaya outbound vs inbound sides)
+    elif "teras jaya" in addr:
+      return 50  # Hit first on outbound side
+    elif "ong yi how" in addr or "teratai" in addr:
+      return (
+          52  # Sequenced right after Teras Jaya before turning back inward
+      )
+    elif "selayang" in addr:
+      return 60
+    elif "sungai dua" in addr or "kampung teluk" in addr:
+      return 70  # Farthest North turnaround point
+
+    # Phase 3: Deep Southern Push (Valdor / Simpang Ampat outbound)
+    elif "valdor" in addr or "sungai jawi" in addr:
+      return 80  # Farthest South turnaround point
+    elif "hijauan hills" in addr or "simpang ampat" in addr:
+      return 85
+
+    # Phase 4: Inbound Return Track (Permatang Tinggi, Bukit Minyak, Juru, BM Town)
+    elif "teguh" in addr or "permatang tinggi" in addr:
+      return 90
+    elif "bukit minyak" in addr:
+      return 100
+    elif "juru" in addr or "simpang juru" in addr:
+      return 110
+    elif "bukit kecil" in addr:
+      return 120
+    elif "maju jaya" in addr:
+      return 130  # First side of Maju Jaya on inbound pass (e.g. Stop C)
+    elif "taman seri maju" in addr or "jalan maju" in addr:
+      return (
+          135  # Further down Maju stream
+      )
+    else:
+      return 140
+
+  return sorted(stops_list, key=lambda x: get_directional_score(x["address"]))
+
+
+if st.button("🚀 Generate Side-of-Road Optimized Route", type="primary"):
   if not raw_data.strip():
     st.warning("Please paste some location data first.")
   else:
-    st.success("Route generated successfully!")
-
-    # Display Start Point
-    st.markdown("### 🛑 START POINT")
-    st.info(f"**Address:** {start_point}")
-    start_map = f"https://www.google.com/maps/dir/?api=1&destination={start_point.replace(' ', '+')}"
-    st.markdown(f"[🗺️ Navigate to Start Point]({start_map})")
-    st.markdown("---")
-
-    # Parse raw text line by line
     lines = raw_data.strip().split("\n")
-    valid_stops = []
+    parsed_stops = []
 
     for line in lines:
       if line.strip():
-        # Split by tabs or multiple spaces if copied from excel/tables
         parts = [p.strip() for p in line.split("\t") if p.strip()]
         if len(parts) >= 2:
-          valid_stops.append({
+          parsed_stops.append({
               "company": parts[0],
               "address": parts[1],
               "contact": parts[2] if len(parts) > 2 else "N/A",
               "phone": parts[3] if len(parts) > 3 else "",
           })
         else:
-          # Fallback if it's pasted as a single block line
-          valid_stops.append(
-              {"company": "Stop Item", "address": line.strip(), "contact": "See details", "phone": ""}
-          )
+          parsed_stops.append({
+              "company": "Stop Item",
+              "address": line.strip(),
+              "contact": "See details",
+              "phone": "",
+          })
 
-    st.markdown(f"### 🛑 STOPS ({len(valid_stops)} Locations)")
+    optimized_stops = smart_directional_sort(parsed_stops)
 
-    for idx, stop in enumerate(valid_stops, 1):
+    st.success(
+        f"Successfully optimized {len(optimized_stops)} stops keeping traffic"
+        " lane flow in mind!"
+    )
+
+    st.markdown("### 🛑 START POINT")
+    st.info(f"**Address:** {start_point}")
+    start_map = f"https://www.google.com/maps/dir/?api=1&destination={start_point.replace(' ', '+')}"
+    st.markdown(f"[🗺️ Navigate to Start Point]({start_map})")
+    st.markdown("---")
+
+    st.markdown("### 🛑 DIRECTIONAL OPTIMIZED STOPS")
+
+    for idx, stop in enumerate(optimized_stops, 1):
       with st.container():
         st.markdown(f"**Stop {idx}: {stop['company']}**")
         st.write(f"📍 **Address:** {stop['address']}")
@@ -72,12 +134,10 @@ if st.button("🚀 Process & Generate Route Cards", type="primary"):
         else:
           st.write(f"📞 **Contact:** {stop['contact']}")
 
-        # Build clean Google Maps navigation link from current location
         maps_url = f"https://www.google.com/maps/dir/?api=1&destination={stop['address'].replace(' ', '+')}"
         st.markdown(f"[🗺️ Navigate From Current Location]({maps_url})")
         st.markdown("---")
 
-    # Display End Point
     st.markdown("### 🏁 END POINT")
     st.info(f"**Address:** {end_point}")
     end_map = f"https://www.google.com/maps/dir/?api=1&destination={end_point.replace(' ', '+')}"
