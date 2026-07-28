@@ -76,7 +76,7 @@ def load_pending_despatch_tasks():
             if company and address and str(address).strip() != "nan":
                 pending_tasks.append({
                     "id": row_idx,
-                    "job_name": str(sheet.cell(row=row_idx, column=5).value or "-"),
+                    "pic_name": str(sheet.cell(row=row_idx, column=5).value or "-"),     # Column E: Our Company PIC
                     "task_type": str(sheet.cell(row=row_idx, column=6).value or "Despatch"),
                     "area": str(sheet.cell(row=row_idx, column=14).value or "Unassigned"),
                     "box": float(sheet.cell(row=row_idx, column=16).value or 0),
@@ -89,7 +89,7 @@ def load_pending_despatch_tasks():
                     "transport": str(sheet.cell(row=row_idx, column=27).value or "Motorcycle"),
                     "sheet_time_slot": str(sheet.cell(row=row_idx, column=28).value or "").strip(),
                     "department": str(sheet.cell(row=row_idx, column=37).value or "-"),
-                    "client": str(sheet.cell(row=row_idx, column=38).value or "N/A"),
+                    "client": str(sheet.cell(row=row_idx, column=38).value or "N/A"),     # Column AL: Client Name
                     "phone": str(sheet.cell(row=row_idx, column=39).value or ""),
                 })
     return pending_tasks
@@ -189,7 +189,7 @@ if st.session_state.page == "setup":
 
     selected_stops = []
     
-    # Render Task List with Department, PIC Name, Parcel Counts & Time Slot Input
+    # Render Task List with Department, Our PIC Name (Col E), Client Name (Col AL), Parcel Counts & Time Slot Input
     for _, row in filtered_df.iterrows():
         row_dict = row.to_dict()
         
@@ -210,7 +210,7 @@ if st.session_state.page == "setup":
             transport_icon = "🚗" if "car" in str(row["transport"]).lower() else "🏍️"
             st.markdown(
                 f"**{row['company']}** {transport_icon} - *{row['task_type']}*<br>"
-                f"<small>🏢 <b>Dept:</b> {row['department']} | 👤 <b>PIC:</b> {row['client']}</small><br>"
+                f"<small>🏢 <b>Dept:</b> {row['department']} | 👤 <b>PIC:</b> {row['pic_name']} | 🤝 <b>Client:</b> {row['client']}</small><br>"
                 f"<small>📄 <b>Items:</b> {items_str}</small><br>"
                 f"<small>📍 {row['address']}</small>", 
                 unsafe_allow_html=True
@@ -275,9 +275,10 @@ elif st.session_state.page == "route":
     
     st.title(f"{stop['company']}")
     
-    # Time Badge
+    # Time Badge & PIC/Dept Info
     time_badge = f"⏰ Slot: {stop['custom_time'].strftime('%I:%M %p')}" if stop.get("custom_time") else "⏰ Flexible / Anytime"
-    st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge} | **Dept:** {stop['department']}")
+    st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge}")
+    st.markdown(f"🏢 **Dept:** {stop['department']} | 👤 **Kalyx PIC:** {stop['pic_name']}")
     st.markdown(f"📍 **Address:** {stop['address']}")
     
     # Parcel Details
@@ -296,11 +297,11 @@ elif st.session_state.page == "route":
     with col_c1:
         if clean_phone and clean_phone != "nan":
             st.markdown(
-                f"<a href='tel:{clean_phone}'><button style='width: 100%; padding:14px; border-radius:8px; border:1px solid #1E90FF; background:transparent; color:#1E90FF; font-weight:bold;'>📞 Call {stop['client']}</button></a>", 
+                f"<a href='tel:{clean_phone}'><button style='width: 100%; padding:14px; border-radius:8px; border:1px solid #1E90FF; background:transparent; color:#1E90FF; font-weight:bold;'>📞 Call Client ({stop['client']})</button></a>", 
                 unsafe_allow_html=True
             )
         else:
-            st.write(f"📞 Contact: {stop['client']} (No phone)")
+            st.write(f"📞 Client Contact: {stop['client']} (No phone)")
             
     with col_c2:
         maps_url = f"https://www.google.com/maps/dir/?api=1&destination={stop['address'].replace(' ', '+')}"
