@@ -27,7 +27,54 @@ if "current_stop" not in st.session_state:
 if "optimization_time" not in st.session_state:
     st.session_state.optimization_time = None
 
-# --- 2. DATA LOADING LOGIC ---
+# --- 2. KPI AGING CALCULATION LOGIC ---
+def calculate_kpi_status(raw_request_date):
+    """
+    Calculates effective request date using 9:30 AM cut-off logic:
+    - Before 9:30 AM -> Same day request
+    - After 9:30 AM -> Next day request
+    Returns days elapsed, status label, badge HTML, and red status flag.
+    """
+    now = datetime.now()
+    req_dt = None
+    
+    if isinstance(raw_request_date, datetime):
+        req_dt = raw_request_date
+    elif isinstance(raw_request_date, str) and raw_request_date.strip():
+        try:
+            req_dt = pd.to_datetime(raw_request_date).to_pydatetime()
+        except:
+            req_dt = now
+
+    if not req_dt:
+        req_dt = now
+
+    # 9:30 AM Cut-off logic
+    if req_dt.time() > time(9, 30):
+        effective_date = req_dt.date() + timedelta(days=1)
+    else:
+        effective_date = req_dt.date()
+
+    days_elapsed = (now.date() - effective_date).days
+    days_elapsed = max(0, days_elapsed)
+
+    if days_elapsed >= 3:
+        status_key = "Overdue"
+        badge_html = f"<span style='background-color:#FF4D4D; color:white; padding:3px 8px; border-radius:4px; font-weight:bold; font-size:12px;'>🚨 OVERDUE ({days_elapsed} Days)</span>"
+        is_red = True
+    elif days_elapsed == 2:
+        status_key = "Due Today (Day 2)"
+        badge_html = f"<span style='background-color:#FFC107; color:black; padding:3px 8px; border-radius:4px; font-weight:bold; font-size:12px;'>⚠️ KPI LIMIT (Day 2)</span>"
+        is_red = False
+    else:
+        status_key = "On Time"
+        badge_html = f"<span style='background-color:#28A745; color:white; padding:3px 8px; border-radius:4px; font-weight:bold; font-size:12px;'>✅ ON TIME ({days_elapsed} Day)</span>"
+        is_red = False
+
+    formatted_req_str = req_dt.strftime("%d/%m/%Y %I:%M %p")
+    return days_elapsed, status_key, badge_html, is_red, formatted_req_str
+
+# --- 3. DATA LOADING LOGIC ---
 @st.cache_data(ttl=30, show_spinner=False)
 def load_pending_despatch_tasks():
     response = requests.get(SHEET_EXPORT_URL)
@@ -38,11 +85,11 @@ def load_pending_despatch_tasks():
     sheet = wb[SHEET_NAME]
     pending_tasks = []
     
-    # 7-day date threshold
-    one_week_ago = datetime.now() - timedelta(days=7)
+    # 14-day date threshold for sheet scan
+    two_weeks_ago = datetime.now() - timedelta(days=14)
 
     for row_idx in range(2, sheet.max_row + 1):
-        # Column A: Date check
+        # Column A: Requested Date
         cell_date = sheet.cell(row=row_idx, column=1).value
         task_date = None
         if isinstance(cell_date, datetime):
@@ -56,7 +103,7 @@ def load_pending_despatch_tasks():
         if task_date:
             if hasattr(task_date, "to_pydatetime"):
                 task_date = task_date.to_pydatetime()
-            if task_date < one_week_ago:
+            if task_date < two_weeks_ago:
                 continue
 
         # Column S (19): Cell Fill Color check. ONLY ORANGE = Complete.
@@ -74,8 +121,16 @@ def load_pending_despatch_tasks():
             company = sheet.cell(row=row_idx, column=17).value
             
             if company and address and str(address).strip() != "nan":
+                days_elapsed, kpi_status, badge_html, is_red, formatted_req_str = calculate_kpi_status(cell_date)
+
                 pending_tasks.append({
                     "id": row_idx,
+                    "requested_date_raw": cell_date,
+                    "requested_date_str": formatted_req_str,
+                    "kpi_days": days_elapsed,
+                    "kpi_status": kpi_status,
+                    "kpi_badge_html": badge_html,
+                    "is_red_overdue": is_red,
                     "pic_name": str(sheet.cell(row=row_idx, column=5).value or "-"),     # Column E: Our Company PIC
                     "task_type": str(sheet.cell(row=row_idx, column=6).value or "Despatch"),
                     "area": str(sheet.cell(row=row_idx, column=14).value or "Unassigned"),
@@ -94,7 +149,7 @@ def load_pending_despatch_tasks():
                 })
     return pending_tasks
 
-# --- 3. GOOGLE SHEETS WRITEBACK (MARK ORANGE) ---
+# --- 4. GOOGLE SHEETS WRITEBACK (MARK ORANGE) ---
 def mark_row_completed_in_sheets(row_idx):
     if "gcp_service_account" not in st.secrets:
         return False
@@ -116,7 +171,7 @@ def mark_row_completed_in_sheets(row_idx):
         st.error(f"Error updating Google Sheet: {e}")
         return False
 
-# --- 4. ROUTE OPTIMIZATION ALGORITHMS ---
+# --- 5. ROUTE OPTIMIZATION ALGORITHMS ---
 def get_directional_score(address):
     addr = str(address).lower()
     if "perai jaya" in addr: return 10
@@ -135,26 +190,21 @@ def get_directional_score(address):
     else: return 140
 
 def optimize_route(stops_list, start_time):
-    # Check if any stop has a custom time input
-    timed_stops = [s for s in stops_list if s.get("custom_time") is not None]
-    
-    # CASE 1: No specific time input provided -> Standard directional optimization
-    if not timed_stops:
-        return sorted(stops_list, key=lambda x: get_directional_score(x["address"]))
-    
-    # CASE 2: Build optimization anchored around jobs with target times
+    # Sort overdue/older tasks higher, then apply custom time / location score
     def get_sort_key(item):
         custom_t = item.get("custom_time")
+        overdue_priority = 0 if item.get("is_red_overdue") else 1
+        
         if custom_t is not None:
             time_val = custom_t.hour * 60 + custom_t.minute
-            return (0, time_val, get_directional_score(item["address"]))
+            return (overdue_priority, 0, time_val, get_directional_score(item["address"]))
         else:
-            return (1, 0, get_directional_score(item["address"]))
+            return (overdue_priority, 1, 0, get_directional_score(item["address"]))
             
     return sorted(stops_list, key=get_sort_key)
 
 
-# --- 5. UI PAGE: SETUP & TASK SELECTION ---
+# --- 6. UI PAGE: SETUP & TASK SELECTION ---
 if st.session_state.page == "setup":
     st.title("🏍️ Kalyx Despatch Route Planner")
     
@@ -171,25 +221,33 @@ if st.session_state.page == "setup":
 
     df_tasks = pd.DataFrame(tasks)
     
-    # Area & Transport Filters
-    col_f1, col_f2 = st.columns(2)
+    # Area, Transport & KPI Filters
+    col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
         selected_area = st.selectbox("📍 Filter Area:", ["All Areas"] + list(df_tasks["area"].unique()))
     with col_f2:
         selected_transport = st.selectbox("🚗/🏍️ Transport:", ["All", "Car", "Motorcycle"])
+    with col_f3:
+        selected_kpi = st.selectbox("⏳ KPI Filter:", ["All Tasks", "🚨 Overdue Only", "⚠️ Due Today (Day 2)", "✅ On Time Only"])
 
     filtered_df = df_tasks
     if selected_area != "All Areas":
         filtered_df = filtered_df[filtered_df["area"] == selected_area]
     if selected_transport != "All":
         filtered_df = filtered_df[filtered_df["transport"].str.contains(selected_transport, case=False)]
+    if selected_kpi == "🚨 Overdue Only":
+        filtered_df = filtered_df[filtered_df["is_red_overdue"] == True]
+    elif selected_kpi == "⚠️ Due Today (Day 2)":
+        filtered_df = filtered_df[filtered_df["kpi_status"] == "Due Today (Day 2)"]
+    elif selected_kpi == "✅ On Time Only":
+        filtered_df = filtered_df[filtered_df["kpi_status"] == "On Time"]
 
     st.markdown(f"### 📋 Pending Tasks ({len(filtered_df)} Available)")
-    st.caption("Select tasks for today's run and optionally set specific target time slots per job:")
+    st.caption("Select tasks for today's run. Tasks highlighted in red exceed the 2-day KPI threshold:")
 
     selected_stops = []
     
-    # Render Task List with Department, Our PIC Name (Col E), Client Name (Col AL), Parcel Counts & Time Slot Input
+    # Render Task List
     for _, row in filtered_df.iterrows():
         row_dict = row.to_dict()
         
@@ -201,6 +259,9 @@ if st.session_state.page == "setup":
         if row["envelope"] > 0: items.append(f"✉️ {int(row['envelope'])} Envelope")
         items_str = " | ".join(items) if items else "No document details"
 
+        # Apply Red warning card formatting if overdue
+        border_style = "border-left: 5px solid #FF4D4D; padding-left: 8px;" if row["is_red_overdue"] else ""
+
         c_check, c_details, c_time = st.columns([0.08, 0.64, 0.28])
         
         with c_check:
@@ -209,10 +270,13 @@ if st.session_state.page == "setup":
         with c_details:
             transport_icon = "🚗" if "car" in str(row["transport"]).lower() else "🏍️"
             st.markdown(
-                f"**{row['company']}** {transport_icon} - *{row['task_type']}*<br>"
+                f"<div style='{border_style}'>"
+                f"<b>{row['company']}</b> {transport_icon} - <i>{row['task_type']}</i> {row['kpi_badge_html']}<br>"
+                f"<small>📅 <b>Requested:</b> {row['requested_date_str']}</small><br>"
                 f"<small>🏢 <b>Dept:</b> {row['department']} | 👤 <b>PIC:</b> {row['pic_name']} | 🤝 <b>Client:</b> {row['client']}</small><br>"
                 f"<small>📄 <b>Items:</b> {items_str}</small><br>"
-                f"<small>📍 {row['address']}</small>", 
+                f"<small>📍 {row['address']}</small>"
+                f"</div>", 
                 unsafe_allow_html=True
             )
             
@@ -248,7 +312,7 @@ if st.session_state.page == "setup":
             st.session_state.page = "route"
             st.rerun()
 
-# --- 6. UI PAGE: SINGLE ROUTE DISPLAY & SEQUENTIAL EXECUTION ---
+# --- 7. UI PAGE: SINGLE ROUTE DISPLAY & SEQUENTIAL EXECUTION ---
 elif st.session_state.page == "route":
     total_stops = len(st.session_state.optimized_route)
     current_idx = st.session_state.current_stop
@@ -275,9 +339,11 @@ elif st.session_state.page == "route":
     
     st.title(f"{stop['company']}")
     
-    # Time Badge & PIC/Dept Info
+    # KPI Badge & Details
+    st.markdown(f"{stop['kpi_badge_html']}", unsafe_allow_html=True)
     time_badge = f"⏰ Slot: {stop['custom_time'].strftime('%I:%M %p')}" if stop.get("custom_time") else "⏰ Flexible / Anytime"
     st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge}")
+    st.markdown(f"📅 **Requested Date:** {stop['requested_date_str']}")
     st.markdown(f"🏢 **Dept:** {stop['department']} | 👤 **Kalyx PIC:** {stop['pic_name']}")
     st.markdown(f"📍 **Address:** {stop['address']}")
     
@@ -325,7 +391,7 @@ elif st.session_state.page == "route":
                 st.session_state.page = "finished"
             st.rerun()
 
-# --- 7. UI PAGE: SHIFT COMPLETED ---
+# --- 8. UI PAGE: SHIFT COMPLETED ---
 elif st.session_state.page == "finished":
     st.balloons()
     st.title("🎉 All Tasks Completed!")
