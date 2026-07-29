@@ -1,9 +1,9 @@
 streamlit
 pandas
 openpyxl
-requests
 gspread
-gspread_formatting
+gspread-formatting
 oauth2client
-ortools
-google-generativeai
+requests
+folium
+streamlit-folium
