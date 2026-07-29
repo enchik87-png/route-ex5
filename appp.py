@@ -12,7 +12,6 @@ import requests
 import streamlit as st
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 st.set_page_config(
     page_title="Kalyx Despatch Terminal", page_icon="🏍️", layout="centered"
@@ -38,8 +37,6 @@ PRESET_LOCATIONS = {
         "coords": (100.4480, 5.5180),
     },
 }
-
-BIG_COST = 999_999_999
 
 # --- 1. SESSION STATE MANAGEMENT ---
 if "page" not in st.session_state:
@@ -243,7 +240,7 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. ROUTE OPTIMIZATION HELPERS ---
+# --- 5. STRICT BLOCK-LOCKING ROUTE OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_coordinates(address):
     search_query = f"{address}, Penang, Malaysia"
@@ -274,166 +271,6 @@ def _haversine_meters(coord_a, coord_b):
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _estimate_drive_seconds(coord_a, coord_b, avg_speed_kmh=35):
-    meters = _haversine_meters(coord_a, coord_b)
-    return int(max(1, meters / (avg_speed_kmh * 1000 / 3600)))
-
-
-def _sanitize_matrix(matrix):
-    clean = []
-    for row in matrix:
-        clean_row = []
-        for val in row:
-            if val is None:
-                clean_row.append(BIG_COST)
-            else:
-                try:
-                    if math.isnan(float(val)):
-                        clean_row.append(BIG_COST)
-                    else:
-                        clean_row.append(int(val))
-                except (TypeError, ValueError):
-                    clean_row.append(BIG_COST)
-        clean.append(clean_row)
-    return clean
-
-
-def _build_duration_matrix(coords_list):
-    coords_str = ";".join(f"{lon},{lat}" for lon, lat in coords_list)
-    url = (
-        "http://router.project-osrm.org/table/v1/driving/"
-        f"{coords_str}?annotations=duration"
-    )
-    try:
-        resp = requests.get(url, timeout=20)
-        data = resp.json()
-        if data.get("code") == "Ok" and data.get("durations"):
-            return _sanitize_matrix(data["durations"])
-    except Exception:
-        pass
-
-    size = len(coords_list)
-    fallback = [[0 if i == j else _estimate_drive_seconds(coords_list[i], coords_list[j]) for j in range(size)] for i in range(size)]
-    return fallback
-
-
-def _solve_fixed_start_end_tsp(duration_matrix, start_idx, end_idx, mandatory_nodes):
-    node_count = len(duration_matrix)
-    manager = pywrapcp.RoutingIndexManager(node_count, 1, [start_idx], [end_idx])
-    routing = pywrapcp.RoutingModel(manager)
-
-    def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return duration_matrix[from_node][to_node]
-
-    transit_cb = routing.RegisterTransitCallback(time_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
-
-    mandatory_set = set(mandatory_nodes)
-    for node in range(node_count):
-        if node not in mandatory_set and node not in {start_idx, end_idx}:
-            routing.AddDisjunction([manager.NodeToIndex(node)], 0)
-
-    search_params = pywrapcp.DefaultRoutingSearchParameters()
-    search_params.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
-    search_params.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-    search_params.time_limit.seconds = 3
-
-    solution = routing.SolveWithParameters(search_params)
-    if not solution:
-        return None
-
-    ordered_nodes = []
-    index = routing.Start(0)
-    while not routing.IsEnd(index):
-        node = manager.IndexToNode(index)
-        if node in mandatory_set:
-            ordered_nodes.append(node)
-        index = solution.Value(routing.NextVar(index))
-    return ordered_nodes
-
-
-def _order_clusters(start_coords, end_coords, area_names, area_centroids):
-    if len(area_names) <= 1:
-        return area_names
-
-    area_coords_list = [start_coords] + [area_centroids[name] for name in area_names] + [end_coords]
-    matrix = _build_duration_matrix(area_coords_list)
-
-    node_count = len(area_coords_list)
-    solution = _solve_fixed_start_end_tsp(
-        matrix,
-        start_idx=0,
-        end_idx=node_count - 1,
-        mandatory_nodes=list(range(1, node_count - 1)),
-    )
-
-    if solution:
-        return [area_names[node - 1] for node in solution]
-
-    remaining = set(area_names)
-    ordered = []
-    current = start_coords
-
-    while remaining:
-        best_name = min(
-            remaining,
-            key=lambda name: (
-                _estimate_drive_seconds(current, area_centroids[name])
-                + 0.35 * _estimate_drive_seconds(area_centroids[name], end_coords)
-            ),
-        )
-        ordered.append(best_name)
-        current = area_centroids[best_name]
-        remaining.remove(best_name)
-
-    return ordered
-
-
-def _order_stops_in_cluster(stops, entry_coords, exit_coords=None):
-    if len(stops) <= 1:
-        return stops
-
-    stop_coords = [stop["coords"] for stop in stops]
-    if exit_coords is None:
-        exit_coords = (
-            entry_coords[0] + 0.00001,
-            entry_coords[1] + 0.00001,
-        )
-
-    coords_list = [entry_coords] + stop_coords + [exit_coords]
-    matrix = _build_duration_matrix(coords_list)
-
-    if exit_coords == (entry_coords[0] + 0.00001, entry_coords[1] + 0.00001):
-        for idx in range(1, len(stops) + 1):
-            matrix[idx][len(coords_list) - 1] = 0
-
-    ordered_indices = _solve_fixed_start_end_tsp(
-        matrix,
-        start_idx=0,
-        end_idx=len(coords_list) - 1,
-        mandatory_nodes=list(range(1, len(stops) + 1)),
-    )
-
-    if ordered_indices:
-        return [stops[idx - 1] for idx in ordered_indices]
-
-    remaining = list(stops)
-    ordered = []
-    current = entry_coords
-    while remaining:
-        nearest = min(remaining, key=lambda stop: _estimate_drive_seconds(current, stop["coords"]))
-        ordered.append(nearest)
-        current = nearest["coords"]
-        remaining.remove(nearest)
-    return ordered
-
-
 def optimize_route_osrm(stops_list, start_key, end_key):
     start_coords = PRESET_LOCATIONS[start_key]["coords"]
     end_coords = PRESET_LOCATIONS[end_key]["coords"]
@@ -447,7 +284,7 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     for i, stop in enumerate(stops_list):
         status_text.text(f"Geocoding {i + 1}/{len(stops_list)}: {stop['company']}...")
         coords = get_coordinates(stop["address"])
-        time_module.sleep(1)
+        time_module.sleep(0.5)
 
         if coords:
             stop["coords"] = coords
@@ -463,11 +300,14 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     if not valid_stops:
         return unmapped_stops
 
+    # 1. Group strictly by zone/postcode cluster key
     areas_dict = {}
     for stop in valid_stops:
         areas_dict.setdefault(stop["area"], []).append(stop)
 
     area_names = list(areas_dict.keys())
+
+    # 2. Compute centroids for each zone cluster to sequence blocks smoothly from start point
     area_centroids = {}
     for area_name, cluster_stops in areas_dict.items():
         lon_sum = sum(stop["coords"][0] for stop in cluster_stops)
@@ -476,25 +316,43 @@ def optimize_route_osrm(stops_list, start_key, end_key):
         area_centroids[area_name] = (lon_sum / count, lat_sum / count)
 
     status_text = st.empty()
-    status_text.text("Sequencing postcode/area clusters from start to end...")
-    ordered_areas = _order_clusters(start_coords, end_coords, area_names, area_centroids)
+    status_text.text("Sequencing strict zone blocks from start to end...")
+
+    # 3. Order zone blocks via nearest neighbor from current position so blocks flow logically
+    remaining_areas = list(area_names)
+    ordered_areas = []
+    current_pos = start_coords
+
+    while remaining_areas:
+        next_area = min(
+            remaining_areas,
+            key=lambda a: _haversine_meters(current_pos, area_centroids[a])
+        )
+        ordered_areas.append(next_area)
+        current_pos = area_centroids[next_area]
+        remaining_areas.remove(next_area)
+
     status_text.empty()
 
+    # 4. Build final sequence: Fully exhaust each zone block before locking and moving to the next
     final_optimized_stops = []
     current_position = start_coords
 
-    for area_index, area_name in enumerate(ordered_areas):
-        cluster_stops = areas_dict[area_name]
-        is_last_cluster = area_index == len(ordered_areas) - 1
-        cluster_exit = end_coords if is_last_cluster else area_centroids[ordered_areas[area_index + 1]]
+    for area_name in ordered_areas:
+        cluster_stops = list(areas_dict[area_name])
+        
+        # Sort stops within this zone using a tight nearest-neighbor chain
+        ordered_cluster = []
+        while cluster_stops:
+            nearest_stop = min(
+                cluster_stops,
+                key=lambda s: _haversine_meters(current_position, s["coords"])
+            )
+            ordered_cluster.append(nearest_stop)
+            current_position = nearest_stop["coords"]
+            cluster_stops.remove(nearest_stop)
 
-        ordered_cluster = _order_stops_in_cluster(
-            cluster_stops,
-            entry_coords=current_position,
-            exit_coords=cluster_exit,
-        )
         final_optimized_stops.extend(ordered_cluster)
-        current_position = ordered_cluster[-1]["coords"]
 
     return final_optimized_stops + unmapped_stops
 
@@ -604,7 +462,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🚀 Calculate Postcode-Clustered Route", type="primary", use_container_width=True):
+    if st.button("🚀 Calculate Strict Zone-Blocked Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -612,7 +470,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("Clustering by postcode and ordering blocks..."):
+            with st.spinner("Locking zone blocks and building route..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
@@ -623,7 +481,7 @@ if st.session_state.page == "setup":
 elif st.session_state.page == "preview":
     st.title("🗺️ Route Preview & Reordering")
     st.caption(
-        "Review your postcode-clustered route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
+        "Review your zone-blocked route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
     )
 
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get(
