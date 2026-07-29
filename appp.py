@@ -227,11 +227,9 @@ def optimize_route_with_gemini(stops_list, start_key, end_key):
         st.error("⚠️ GEMINI_API_KEY is missing in Streamlit Secrets!")
         return stops_list
 
-    # Configure the AI model
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
     model = genai.GenerativeModel('gemini-2.5-flash')
 
-    # Prepare lightweight data for the AI to analyze
     minimal_stops = []
     for stop in stops_list:
         minimal_stops.append({
@@ -240,7 +238,6 @@ def optimize_route_with_gemini(stops_list, start_key, end_key):
             "address": f"[{stop['area']}] {stop['address']}, Penang, Malaysia"
         })
 
-    # The prompt that gives Gemini its instructions
     prompt = f"""
     You are an expert logistics dispatcher operating in Penang, Malaysia.
     I have a list of delivery stops. I need you to sequence them in the most logical, 
@@ -263,11 +260,9 @@ def optimize_route_with_gemini(stops_list, start_key, end_key):
     try:
         response = model.generate_content(prompt)
         
-        # Clean up the AI's response to ensure it's pure JSON
         clean_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         optimized_ids = json.loads(clean_text)
 
-        # Rebuild the stops list in the new AI-optimized order
         optimized_stops = []
         for opt_id in optimized_ids:
             for original_stop in stops_list:
@@ -275,7 +270,6 @@ def optimize_route_with_gemini(stops_list, start_key, end_key):
                     optimized_stops.append(original_stop)
                     break
 
-        # Failsafe: if the AI accidentally missed a stop, put it at the end
         for original_stop in stops_list:
             if original_stop not in optimized_stops:
                 optimized_stops.append(original_stop)
@@ -527,7 +521,6 @@ elif st.session_state.page == "route":
             st.write(f"📞 Client Contact: {stop['client']} (No phone)")
 
     with col_c2:
-        # We pass Company + Address to Google Maps for exact navigation
         search_query = f"{stop['company']}, {stop['address']}, Penang, Malaysia"
         maps_url = f"[https://www.google.com/maps/dir/?api=1&destination=](https://www.google.com/maps/dir/?api=1&destination=){urllib.parse.quote(search_query)}"
         st.markdown(
