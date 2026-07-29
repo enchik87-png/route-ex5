@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import re
 import time as time_module
 import urllib.parse
@@ -28,6 +29,32 @@ PRESET_LOCATIONS = {
     "Machang Bubok (Home)": "🏠 Machang Bubok, Bukit Mertajam",
     "Taman Sri Serdang, Bertam (Home)": "🏠 Taman Sri Serdang, Bertam, Kepala Batas",
 }
+
+# --- PENANG POSTCODE & START GPS COORDINATES LOOKUP ---
+PENANG_POSTCODE_GPS = {
+    "13200": (5.515, 100.430),  # Kepala Batas / Bertam
+    "13300": (5.480, 100.480),  # Tasek Gelugor
+    "13800": (5.445, 100.430),  # Sungai Dua / Kg Teluk / Lokan
+    "13000": (5.412, 100.370),  # Butterworth
+    "13020": (5.418, 100.380),  # Butterworth / Selayang Indah
+    "13400": (5.420, 100.380),  # Butterworth / Bagan
+    "13500": (5.372, 100.410),  # Permatang Pauh / Elevate
+    "13700": (5.390, 100.400),  # Seberang Jaya
+    "13600": (5.360, 100.390),  # Perai / Prai
+    "14000": (5.350, 100.460),  # Bukit Mertajam / Juru / Permatang Tinggi
+    "14100": (5.300, 100.450),  # Simpang Ampat / Bukit Minyak / Tambun
+    "14120": (5.280, 100.480),  # Simpang Ampat / Villa Begonia / Hijauan Hills
+    "14200": (5.220, 100.490),  # Sungai Bakap
+    "14300": (5.170, 100.480),  # Nibong Tebal
+    "14400": (5.200, 100.500),  # Valdor
+}
+
+PRESET_COORDS = {
+    "Kalyx Consultants Sdn Bhd (Office)": (5.343, 100.433),  # Icon City, Bukit Mertajam
+    "Machang Bubok (Home)": (5.338, 100.508),               # Machang Bubok
+    "Taman Sri Serdang, Bertam (Home)": (5.518, 100.440)    # Bertam, Kepala Batas
+}
+
 
 # --- 1. SESSION STATE MANAGEMENT ---
 if "page" not in st.session_state:
@@ -220,58 +247,52 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. ALGORITHMIC ZONE & POSTCODE ROUTE OPTIMIZATION ---
+# --- 5. GPS NEAREST-NEIGHBOR ROUTE OPTIMIZATION ---
+def get_stop_coords(stop):
+    """Extracts 5-digit postcode (1xxxx) from address and maps to coordinates."""
+    combined_text = f"{stop.get('area', '')} {stop.get('address', '')}"
+    match = re.search(r"\b(1\d{4})\b", combined_text)
+    if match:
+        pc = match.group(1)
+        if pc in PENANG_POSTCODE_GPS:
+            return PENANG_POSTCODE_GPS[pc]
+    return (5.350, 100.450)  # Default fallback fallback centroid (BM)
+
+def haversine_distance(coord1, coord2):
+    """Calculates straight-line grid distance between two GPS points."""
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+    return math.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2)
+
 def optimize_route_with_gemini(stops_list, start_key, end_key):
-    """Optimizes route deterministically using area/postcode clustering 
-    to eliminate zig-zagging, completely independent of LLM guesswork.
+    """Deterministically links stops using nearest-neighbor routing
+
+    starting from the chosen Start Point to completely prevent zig-zagging.
     """
     if not stops_list:
         return []
 
-    # 1. Separate stops by their extracted zone/postcode cluster
-    clusters = {}
-    for stop in stops_list:
-        cluster_name = stop.get("area", "Unassigned")
-        if cluster_name not in clusters:
-            clusters[cluster_name] = []
-        clusters[cluster_name].append(stop)
+    start_coords = PRESET_COORDS.get(start_key, (5.343, 100.433))
+    unvisited = stops_list.copy()
+    optimized = []
+    
+    current_pos = start_coords
 
-    # 2. Define a logical geographical flow for Penang/Seberang Perai regions
-    zone_priority = [
-        "Icon City",
-        "Bukit Mertajam",
-        "Machang Bubok",
-        "Juru",
-        "Perai",
-        "Butterworth",
-        "Kepala Batas",
-        "Bertam",
-        "Simpang Ampat",
-        "Nibong Tebal",
-        "Penang Island",
-    ]
+    while unvisited:
+        closest_stop = min(
+            unvisited, 
+            key=lambda s: haversine_distance(current_pos, get_stop_coords(s))
+        )
+        optimized.append(closest_stop)
+        current_pos = get_stop_coords(closest_stop)
+        unvisited.remove(closest_stop)
 
-    sorted_clusters = []
-    for zone in zone_priority:
-        matching_keys = [k for k in clusters.keys() if zone.lower() in k.lower()]
-        for mk in matching_keys:
-            sorted_clusters.append(clusters.pop(mk))
-
-    for remaining_zone_stops in clusters.values():
-        sorted_clusters.append(remaining_zone_stops)
-
-    # 3. Flatten the clustered stops into a smooth driving sequence
-    optimized_stops = []
-    for cluster_stops in sorted_clusters:
-        cluster_stops_sorted = sorted(cluster_stops, key=lambda x: x["company"])
-        optimized_stops.extend(cluster_stops_sorted)
-
-    return optimized_stops
+    return optimized
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
 if st.session_state.page == "setup":
-    st.title("🏍️ Kalyx AI Despatch Planner")
+    st.title("🏍️ Kalyx Despatch Terminal")
 
     with st.spinner("Fetching live pending tasks..."):
         try:
@@ -374,7 +395,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🧠 Calculate Smart Route", type="primary", use_container_width=True):
+    if st.button("⚡ Calculate Smart Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -382,7 +403,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("⚡ Grouping and organizing optimal route zones..."):
+            with st.spinner("⚡ Processing GPS nearest-neighbor routing..."):
                 st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
