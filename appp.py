@@ -30,22 +30,31 @@ PRESET_LOCATIONS = {
     "Taman Sri Serdang, Bertam (Home)": "🏠 Taman Sri Serdang, Bertam, Kepala Batas",
 }
 
-# --- PENANG MAINLAND POSTCODE GPS (Strict South-to-North Latitudes per MyPostcode.my) ---
+# --- PENANG MAINLAND POSTCODE & SUB-AREA GPS (Strict South-to-North Latitudes) ---
 PENANG_POSTCODE_GPS = {
     "14300": (5.170, 100.480),  # Nibong Tebal (Southmost)
     "14200": (5.220, 100.490),  # Sungai Bakap
     "14400": (5.200, 100.500),  # Valdor
     "14110": (5.250, 100.440),  # Batu Kawan / Bandar Cassia
     "14120": (5.280, 100.480),  # Simpang Ampat (Villa Begonia / Hijauan Hills)
-    "14100": (5.300, 100.450),  # Simpang Ampat / Bukit Minyak / Tambun
-    "14000": (5.350, 100.460),  # Bukit Mertajam / Juru / Permatang Tinggi
-    "13600": (5.360, 100.390),  # Perai / Kawasan Perusahaan Perai
-    "13500": (5.372, 100.410),  # Permatang Pauh / Taman Pauh Jaya
+    # 14100 Sub-areas (South to North)
+    "14100_serijuru": (5.290, 100.430),
+    "14100_tambun": (5.300, 100.440),
+    "14100_bukitminyak": (5.310, 100.450),
+    "14100": (5.305, 100.445),
+    # 14000 Sub-areas (South to North: Juru -> Permatang Tinggi / Teguh -> BM Town)
+    "14000_juru": (5.330, 100.435),
+    "14000_teguh": (5.340, 100.450),
+    "14000_bm": (5.355, 100.465),
+    "14000": (5.350, 100.460),
+    # Northward Postcodes
+    "13600": (5.360, 100.390),  # Perai
+    "13500": (5.372, 100.410),  # Permatang Pauh / Elevate
     "13700": (5.390, 100.400),  # Seberang Jaya
     "13000": (5.412, 100.370),  # Butterworth
     "13020": (5.418, 100.380),  # Butterworth / Selayang Indah
     "13400": (5.420, 100.380),  # Butterworth / Bagan / Mak Mandin
-    "13800": (5.445, 100.430),  # Sungai Dua / Kampung Teluk
+    "13800": (5.445, 100.430),  # Sungai Dua / Kampung Teluk / Sungai Lokan
     "13300": (5.480, 100.480),  # Tasek Gelugor
     "13200": (5.515, 100.430),  # Kepala Batas / Bertam (Northmost)
 }
@@ -248,28 +257,42 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. SOUTH-TO-NORTH DIRECTIONAL SWEEP ROUTE OPTIMIZATION ---
+# --- 5. MICRO-AREA STREET LEVEL SOUTH-TO-NORTH SWEEP ROUTING ---
 def get_stop_coords(stop):
-    """Extracts 5-digit postcode (1xxxx) from address and maps to coordinates."""
-    combined_text = f"{stop.get('area', '')} {stop.get('address', '')}"
+    """Extracts 5-digit postcode and checks sub-area keywords for micro-sorting."""
+    combined_text = f"{stop.get('area', '')} {stop.get('address', '')}".lower()
     match = re.search(r"\b(1\d{4})\b", combined_text)
+    
     if match:
         pc = match.group(1)
-        if pc in PENANG_POSTCODE_GPS:
+        if pc == "14000":
+            if "juru" in combined_text:
+                return PENANG_POSTCODE_GPS["14000_juru"]
+            elif any(k in combined_text for k in ["teguh", "permatang tinggi"]):
+                return PENANG_POSTCODE_GPS["14000_teguh"]
+            else:
+                return PENANG_POSTCODE_GPS["14000_bm"]
+        elif pc == "14100":
+            if "seri juru" in combined_text:
+                return PENANG_POSTCODE_GPS["14100_serijuru"]
+            elif "tambun" in combined_text:
+                return PENANG_POSTCODE_GPS["14100_tambun"]
+            else:
+                return PENANG_POSTCODE_GPS["14100_bukitminyak"]
+        elif pc in PENANG_POSTCODE_GPS:
             return PENANG_POSTCODE_GPS[pc]
-    return (5.350, 100.450)  # Default fallback centroid (BM)
+
+    return (5.350, 100.450)  # Default fallback centroid
 
 def optimize_route_with_gemini(stops_list, start_key, end_key):
     """Deterministically sorts stops in a strict South-to-North direction
 
-    (Nibong Tebal 14300 -> Simpang Ampat 141xx -> Bukit Minyak/Juru 140xx -> Perai 13600 -> Permatang Pauh 13500 -> Butterworth 130xx)
-    to completely eliminate zig-zagging.
+    with micro-neighborhood granularity to completely eliminate backtracking.
     """
     if not stops_list:
         return []
 
-    # Sort stops strictly by latitude ascending (South to North: lowest latitude first)
-    # Secondary sort alphabetically by company name for clean alphabetical grouping within the same postcode.
+    # Sort strictly by micro-latitude ascending (South to North)
     sorted_stops = sorted(
         stops_list, 
         key=lambda s: (get_stop_coords(s)[0], s.get("company", ""))
@@ -391,7 +414,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("⚡ Processing South-to-North sweep routing..."):
+            with st.spinner("⚡ Processing micro-area South-to-North routing..."):
                 st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
