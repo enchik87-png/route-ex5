@@ -1,5 +1,5 @@
 import io
-import math
+import json
 import re
 import time as time_module
 import urllib.parse
@@ -10,6 +10,7 @@ import openpyxl
 import pandas as pd
 import requests
 import streamlit as st
+import google.generativeai as genai
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -22,20 +23,11 @@ SHEET_ID = "1YZgwm11scCWdiH5-9RxBVe3kEk9obfNtlH4frIYZGSg"
 SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 SHEET_NAME = "Despatch"
 
-# --- PRESET START & END LOCATIONS (WITH GPS COORDINATES) ---
+# --- PRESET START & END LOCATIONS ---
 PRESET_LOCATIONS = {
-    "Kalyx Consultants Sdn Bhd (Office)": {
-        "label": "🏢 Kalyx Consultants (Icon City)",
-        "coords": (100.4435, 5.3456),
-    },
-    "Machang Bubok (Home)": {
-        "label": "🏠 Machang Bubok (Home)",
-        "coords": (100.5100, 5.3300),
-    },
-    "Taman Sri Serdang, Bertam (Home)": {
-        "label": "🏠 Taman Sri Serdang, Bertam (Home)",
-        "coords": (100.4480, 5.5180),
-    },
+    "Kalyx Consultants Sdn Bhd (Office)": "🏢 Kalyx Consultants (Icon City, Bukit Mertajam)",
+    "Machang Bubok (Home)": "🏠 Machang Bubok, Bukit Mertajam",
+    "Taman Sri Serdang, Bertam (Home)": "🏠 Taman Sri Serdang, Bertam, Kepala Batas",
 }
 
 # --- 1. SESSION STATE MANAGEMENT ---
@@ -113,7 +105,6 @@ def _normalize_area_name(raw_area):
         return ""
     return cleaned
 
-
 def get_cluster_key(raw_area, address):
     combined_text = f"{str(raw_area)} {str(address)}"
     postcode_match = re.search(r"\b(\d{5})\b", combined_text)
@@ -123,7 +114,6 @@ def get_cluster_key(raw_area, address):
     if cleaned:
         return f"Area: {cleaned}"
     return "Unassigned"
-
 
 def _safe_float(value, default=0.0):
     try:
@@ -231,188 +221,75 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. DYNAMIC API SEARCH & STRICT BLOCK-LOCKING OPTIMIZATION ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_location_and_postcode(search_query):
-    """
-    Searches for the company or address, gets GPS coordinates, 
-    and dynamically extracts the official 5-digit postcode.
-    """
-    # 1. OPTIONAL: GOOGLE MAPS API (If you add a Key to Streamlit Secrets)
-    if "GOOGLE_MAPS_API_KEY" in st.secrets:
-        api_key = st.secrets["GOOGLE_MAPS_API_KEY"]
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={urllib.parse.quote(search_query)}&key={api_key}"
-        try:
-            resp = requests.get(url, timeout=8).json()
-            if resp.get("status") == "OK" and resp.get("results"):
-                result = resp["results"][0]
-                lat = result["geometry"]["location"]["lat"]
-                lon = result["geometry"]["location"]["lng"]
-                
-                postcode = None
-                for component in result.get("address_components", []):
-                    if "postal_code" in component.get("types", []):
-                        postcode = component["long_name"]
-                        break
-                
-                # Regex fallback on formatted address just in case
-                if not postcode:
-                    fmt_address = result.get("formatted_address", "")
-                    match = re.search(r"\b(\d{5})\b", fmt_address)
-                    if match:
-                        postcode = match.group(1)
+# --- 5. GEMINI AI ROUTE OPTIMIZATION ---
+def optimize_route_with_gemini(stops_list, start_key, end_key):
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error("⚠️ GEMINI_API_KEY is missing in Streamlit Secrets!")
+        return stops_list
 
-                if postcode:
-                    return lon, lat, f"Postcode {postcode}"
-                return lon, lat, None
-        except Exception:
-            pass
+    # Configure the AI model
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel('gemini-2.5-flash')
 
-    # 2. DEFAULT: FREE NOMINATIM OPENSTREETMAP SEARCH
-    # (Acts as a free fallback if no Google API Key is provided)
-    url = (
-        "https://nominatim.openstreetmap.org/search?"
-        f"q={urllib.parse.quote(search_query)}&format=json&addressdetails=1&limit=1"
-    )
-    headers = {"User-Agent": "KalyxDespatchApp/1.0"}
+    # Prepare lightweight data for the AI to analyze
+    minimal_stops = []
+    for stop in stops_list:
+        minimal_stops.append({
+            "id": stop["id"],
+            "company": stop["company"],
+            "address": f"[{stop['area']}] {stop['address']}, Penang, Malaysia"
+        })
+
+    # The prompt that gives Gemini its instructions
+    prompt = f"""
+    You are an expert logistics dispatcher operating in Penang, Malaysia.
+    I have a list of delivery stops. I need you to sequence them in the most logical, 
+    efficient driving order to minimize back-and-forth travel time.
+
+    Start Point: {PRESET_LOCATIONS[start_key]}
+    End Point: {PRESET_LOCATIONS[end_key]}
+
+    Here are the stops to sequence:
+    {json.dumps(minimal_stops, indent=2)}
+
+    RULES:
+    1. Group locations in the same geographical area/postcode together.
+    2. Create a smooth flow from the Start Point to the End Point.
+    3. Return ONLY a valid JSON array containing the "id" integers in the exact optimized order.
+    4. Do not include any formatting, markdown, ```json, or explanations. Just the array.
+    Example: [14, 5, 2, 9]
+    """
 
     try:
-        resp = requests.get(url, headers=headers, timeout=8)
-        if resp.status_code == 200 and resp.json():
-            data = resp.json()[0]
-            lat = float(data["lat"])
-            lon = float(data["lon"])
-            
-            # Extract postcode explicitly from address data
-            postcode = data.get("address", {}).get("postcode")
-            
-            # If missing, scrape the full display text for a 5-digit number
-            if not postcode:
-                display_name = data.get("display_name", "")
-                match = re.search(r"\b(\d{5})\b", display_name)
-                if match:
-                    postcode = match.group(1)
-            
-            if postcode:
-                return lon, lat, f"Postcode {postcode}"
-            return lon, lat, None
-    except Exception:
-        pass
-    
-    return None, None, None
-
-
-def _haversine_meters(coord_a, coord_b):
-    lon1, lat1 = coord_a
-    lon2, lat2 = coord_b
-    r = 6371000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def optimize_route_osrm(stops_list, start_key, end_key):
-    start_coords = PRESET_LOCATIONS[start_key]["coords"]
-
-    valid_stops = []
-    unmapped_stops = []
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, stop in enumerate(stops_list):
-        # Determine whether to search by Address OR Company Name
-        address_val = str(stop["address"]).strip()
-        if not address_val or address_val.lower() in {"nan", "-", "none", ""}:
-            status_text.text(f"Searching Company '{stop['company']}' via Live Geocoder...")
-            search_query = f"{stop['company']}, Penang, Malaysia"
-        else:
-            status_text.text(f"Fetching Live Postcode & GPS for {stop['company']}...")
-            search_query = f"{address_val}, Penang, Malaysia"
-            
-        lon, lat, fetched_postcode = fetch_location_and_postcode(search_query)
-        time_module.sleep(0.6) # Gentle delay to respect API rate limits
-
-        if lat is not None and lon is not None:
-            stop["coords"] = (lon, lat)
-            
-            # OVERRIDE the old grouping if the API found a verified postcode
-            if fetched_postcode:
-                stop["area"] = fetched_postcode
-                
-            valid_stops.append(stop)
-        else:
-            unmapped_stops.append(stop)
-
-        progress_bar.progress((i + 1) / len(stops_list))
-
-    status_text.empty()
-    progress_bar.empty()
-
-    if not valid_stops:
-        return unmapped_stops
-
-    # 1. Group strictly by the NEWLY FETCHED zone/postcode cluster key
-    areas_dict = {}
-    for stop in valid_stops:
-        areas_dict.setdefault(stop["area"], []).append(stop)
-
-    area_names = list(areas_dict.keys())
-
-    # 2. Compute centroids for each zone cluster
-    area_centroids = {}
-    for area_name, cluster_stops in areas_dict.items():
-        lon_sum = sum(stop["coords"][0] for stop in cluster_stops)
-        lat_sum = sum(stop["coords"][1] for stop in cluster_stops)
-        count = len(cluster_stops)
-        area_centroids[area_name] = (lon_sum / count, lat_sum / count)
-
-    status_text = st.empty()
-    status_text.text("Sequencing strict zone blocks from start to end...")
-
-    # 3. Order zone blocks via nearest neighbor
-    remaining_areas = list(area_names)
-    ordered_areas = []
-    current_pos = start_coords
-
-    while remaining_areas:
-        next_area = min(
-            remaining_areas,
-            key=lambda a: _haversine_meters(current_pos, area_centroids[a])
-        )
-        ordered_areas.append(next_area)
-        current_pos = area_centroids[next_area]
-        remaining_areas.remove(next_area)
-
-    status_text.empty()
-
-    # 4. Build final sequence: Fully exhaust each zone block before locking and moving on
-    final_optimized_stops = []
-    current_position = start_coords
-
-    for area_name in ordered_areas:
-        cluster_stops = list(areas_dict[area_name])
+        response = model.generate_content(prompt)
         
-        ordered_cluster = []
-        while cluster_stops:
-            nearest_stop = min(
-                cluster_stops,
-                key=lambda s: _haversine_meters(current_position, s["coords"])
-            )
-            ordered_cluster.append(nearest_stop)
-            current_position = nearest_stop["coords"]
-            cluster_stops.remove(nearest_stop)
+        # Clean up the AI's response to ensure it's pure JSON
+        clean_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+        optimized_ids = json.loads(clean_text)
 
-        final_optimized_stops.extend(ordered_cluster)
+        # Rebuild the stops list in the new AI-optimized order
+        optimized_stops = []
+        for opt_id in optimized_ids:
+            for original_stop in stops_list:
+                if original_stop["id"] == opt_id:
+                    optimized_stops.append(original_stop)
+                    break
 
-    return final_optimized_stops + unmapped_stops
+        # Failsafe: if the AI accidentally missed a stop, put it at the end
+        for original_stop in stops_list:
+            if original_stop not in optimized_stops:
+                optimized_stops.append(original_stop)
+
+        return optimized_stops
+
+    except Exception as e:
+        st.error(f"⚠️ AI Routing failed (returning original order). Error: {e}")
+        return stops_list
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
 if st.session_state.page == "setup":
-    st.title("🏍️ Kalyx AI Despatch Route Planner")
+    st.title("🏍️ Kalyx AI Despatch Planner")
 
     with st.spinner("Fetching live pending tasks..."):
         try:
@@ -515,7 +392,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🚀 Calculate Strict Zone-Blocked Route", type="primary", use_container_width=True):
+    if st.button("🧠 Calculate Smart Route with Gemini AI", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -523,8 +400,8 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("Executing Web Search, Fetching Postcodes, and Locking Route..."):
-                st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
+            with st.spinner("🤖 Gemini is analyzing addresses and optimizing the best route..."):
+                st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
             st.rerun()
@@ -534,15 +411,11 @@ if st.session_state.page == "setup":
 elif st.session_state.page == "preview":
     st.title("🗺️ Route Preview & Reordering")
     st.caption(
-        "Review your zone-blocked route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
+        "Review your Gemini AI route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
     )
 
-    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get(
-        "label", st.session_state.start_point
-    )
-    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get(
-        "label", st.session_state.end_point
-    )
+    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, st.session_state.start_point)
+    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, st.session_state.end_point)
     st.info(f"🚩 **Start Point:** {start_label}  \n🏁 **End Point:** {end_label}")
     st.markdown("---")
 
@@ -610,19 +483,9 @@ elif st.session_state.page == "route":
 
     st.progress((current_idx + 1) / total_stops)
 
-    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get(
-        "label", st.session_state.start_point
-    )
-    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get(
-        "label", st.session_state.end_point
-    )
+    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, st.session_state.start_point)
+    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, st.session_state.end_point)
     st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
-
-    if "coords" not in stop:
-        st.warning(
-            "⚠️ **GPS Warning:** This address couldn't be automatically mapped. It has been placed in your route."
-        )
-
     st.markdown("---")
 
     transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
@@ -664,7 +527,9 @@ elif st.session_state.page == "route":
             st.write(f"📞 Client Contact: {stop['client']} (No phone)")
 
     with col_c2:
-        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={urllib.parse.quote(stop['address'])}"
+        # We pass Company + Address to Google Maps for exact navigation
+        search_query = f"{stop['company']}, {stop['address']}, Penang, Malaysia"
+        maps_url = f"[https://www.google.com/maps/dir/?api=1&destination=](https://www.google.com/maps/dir/?api=1&destination=){urllib.parse.quote(search_query)}"
         st.markdown(
             f"<a href='{maps_url}' target='_blank'><button style='width: 100%; padding:14px; border-radius:8px; border:1px solid #28a745; background:transparent; color:#28a745; font-weight:bold;'>🗺️ Navigate</button></a>",
             unsafe_allow_html=True,
