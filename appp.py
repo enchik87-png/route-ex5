@@ -188,7 +188,7 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. GPS GEOCODING & ADVANCED OR-TOOLS OPTIMIZATION ---
+# --- 5. GPS GEOCODING & AREA-CLUSTERED ROUTE OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_coordinates(address):
     search_query = f"{address}, Penang, Malaysia"
@@ -245,56 +245,116 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     if not valid_stops:
         return unmapped_stops
 
-    all_coords = [start_coords] + [s["coords"] for s in valid_stops] + [end_coords]
-    
-    status_text.text("Calculating optimal Penang traffic road routes...")
-    time_matrix = get_osrm_matrix(all_coords)
-    status_text.empty()
-    
-    if not time_matrix:
-        st.warning("⚠️ Could not connect to OSRM road network. Falling back to default sorting.")
-        return valid_stops + unmapped_stops
+    # --- STEP 1: GROUP STOPS BY AREA ---
+    areas_dict = {}
+    for stop in valid_stops:
+        area_name = str(stop.get("area", "Unassigned")).strip()
+        if not area_name or area_name.lower() == "nan":
+            area_name = "Unassigned"
+        if area_name not in areas_dict:
+            areas_dict[area_name] = []
+        areas_dict[area_name].append(stop)
 
-    num_locations = len(all_coords)
-    start_index = 0
-    end_index = num_locations - 1
-    
-    manager = pywrapcp.RoutingIndexManager(num_locations, 1, [start_index], [end_index])
-    routing = pywrapcp.RoutingModel(manager)
+    # --- STEP 2: CALCULATE AREA CENTROIDS & ORDER AREAS LOGICALLY ---
+    area_names = list(areas_dict.keys())
+    area_centroids = {}
+    for area_name, stops in areas_dict.items():
+        lon_sum = sum(s["coords"][0] for s in stops)
+        lat_sum = sum(s["coords"][1] for s in stops)
+        count = len(stops)
+        area_centroids[area_name] = (lon_sum / count, lat_sum / count)
 
-    def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return int(time_matrix[from_node][to_node])
+    if len(area_names) > 1:
+        # Build area routing matrix: [Start] + [Area Centroids...] + [End]
+        area_coords_list = [start_coords] + [area_centroids[a] for a in area_names] + [end_coords]
+        status_text.text("Clustering areas and sequencing route flow...")
+        matrix = get_osrm_matrix(area_coords_list)
+        status_text.empty()
 
-    transit_callback_index = routing.RegisterTransitCallback(time_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+        if matrix:
+            n_areas = len(area_names)
+            num_locs = n_areas + 2
+            manager = pywrapcp.RoutingIndexManager(num_locs, 1, [0], [num_locs - 1])
+            routing = pywrapcp.RoutingModel(manager)
 
-    # --- ADVANCED GLOBAL OPTIMIZATION PARAMETERS ---
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    )
-    search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
-    search_parameters.time_limit.seconds = 3
+            def area_time_callback(from_index, to_index):
+                f_node = manager.IndexToNode(from_index)
+                t_node = manager.IndexToNode(to_index)
+                return int(matrix[f_node][t_node])
 
-    solution = routing.SolveWithParameters(search_parameters)
+            transit_cb = routing.RegisterTransitCallback(area_time_callback)
+            routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-    optimized_stops = []
-    if solution:
-        index = routing.Start(0)
-        index = solution.Value(routing.NextVar(index))
-        
-        while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            optimized_stops.append(valid_stops[node_index - 1])
-            index = solution.Value(routing.NextVar(index))
+            search_params = pywrapcp.DefaultRoutingSearchParameters()
+            search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+            search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+            search_params.time_limit.seconds = 2
+
+            sol = routing.SolveWithParameters(search_params)
+            ordered_areas = []
+            if sol:
+                idx = routing.Start(0)
+                idx = sol.Value(routing.NextVar(idx))
+                while not routing.IsEnd(idx):
+                    node_idx = manager.IndexToNode(idx)
+                    if 1 <= node_idx <= n_areas:
+                        ordered_areas.append(area_names[node_idx - 1])
+                    idx = sol.Value(routing.NextVar(idx))
+            else:
+                ordered_areas = area_names
+        else:
+            ordered_areas = area_names
     else:
-        optimized_stops = valid_stops
+        ordered_areas = area_names
 
-    return optimized_stops + unmapped_stops
+    # --- STEP 3: OPTIMIZE STOPS WITHIN EACH AREA CLUSTER ---
+    final_optimized_stops = []
+    for area_name in ordered_areas:
+        cluster_stops = areas_dict[area_name]
+        if len(cluster_stops) <= 1:
+            final_optimized_stops.extend(cluster_stops)
+            continue
+
+        sub_coords = [s["coords"] for s in cluster_stops]
+        sub_matrix = get_osrm_matrix(sub_coords)
+        
+        if sub_matrix and len(cluster_stops) > 2:
+            n_sub = len(cluster_stops)
+            sub_manager = pywrapcp.RoutingIndexManager(n_sub, 1, 0, n_sub - 1)
+            sub_routing = pywrapcp.RoutingModel(sub_manager)
+
+            def sub_cb(f, t):
+                return int(sub_matrix[sub_manager.IndexToNode(f)][sub_manager.IndexToNode(t)])
+
+            sub_transit = sub_routing.RegisterTransitCallback(sub_cb)
+            sub_routing.SetArcCostEvaluatorOfAllVehicles(sub_transit)
+
+            sub_params = pywrapcp.DefaultRoutingSearchParameters()
+            sub_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+            sub_params.time_limit.seconds = 1
+
+            sub_sol = sub_routing.SolveWithParameters(sub_params)
+            if sub_sol:
+                sub_ordered = []
+                s_idx = sub_routing.Start(0)
+                s_idx = sub_sol.Value(sub_routing.NextVar(s_idx))
+                while not sub_routing.IsEnd(s_idx):
+                    n_idx = sub_manager.IndexToNode(s_idx)
+                    sub_ordered.append(cluster_stops[n_idx])
+                    s_idx = sub_sol.Value(sub_routing.NextVar(s_idx))
+                
+                # Ensure all cluster stops are included
+                included_ids = {s["id"] for s in sub_ordered}
+                for s in cluster_stops:
+                    if s["id"] not in included_ids:
+                        sub_ordered.append(s)
+                final_optimized_stops.extend(sub_ordered)
+            else:
+                final_optimized_stops.extend(cluster_stops)
+        else:
+            final_optimized_stops.extend(cluster_stops)
+
+    return final_optimized_stops + unmapped_stops
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
@@ -363,7 +423,7 @@ if st.session_state.page == "setup":
                 f"<small>📅 <b>Requested:</b> {row['requested_date_str']}</small><br>"
                 f"<small>🏢 <b>Dept:</b> {row['department']} | 👤 <b>PIC:</b> {row['pic_name']} | 🤝 <b>Client:</b> {row['client']}</small><br>"
                 f"<small>📄 <b>Items:</b> {items_str}</small><br>"
-                f"<small>📍 {row['address']}</small>"
+                f"<small>📍 [{row['area']}] {row['address']}</small>"
                 f"</div>", 
                 unsafe_allow_html=True
             )
@@ -395,7 +455,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🚀 Calculate AI Road Route", type="primary", use_container_width=True):
+    if st.button("🚀 Calculate Area-Clustered Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -403,7 +463,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            with st.spinner("Analyzing maps and optimizing clusters..."):
+            with st.spinner("Clustering areas and optimizing flow..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
             
             st.session_state.page = "preview"
@@ -413,7 +473,7 @@ if st.session_state.page == "setup":
 # --- 7. UI PAGE: ROUTE PREVIEW & MANUAL ADJUSTMENT ---
 elif st.session_state.page == "preview":
     st.title("🗺️ Route Preview & Reordering")
-    st.caption("Review your AI-optimized route below. Use the ⬆️ and ⬇️ buttons to manually move stops if needed.")
+    st.caption("Review your area-clustered route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed.")
     
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
@@ -445,7 +505,7 @@ elif st.session_state.page == "preview":
         with c_info:
             st.markdown(
                 f"<b>{stop['company']}</b> {transport_icon} {stop['kpi_badge_html']}<br>"
-                f"<small>📍 {stop['address']}</small>", 
+                f"<small>📍 <b>[{stop['area']}]</b> {stop['address']}</small>", 
                 unsafe_allow_html=True
             )
         st.markdown("---")
@@ -499,7 +559,7 @@ elif st.session_state.page == "route":
     st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge}")
     st.markdown(f"📅 **Requested Date:** {stop['requested_date_str']}")
     st.markdown(f"🏢 **Dept:** {stop['department']} | 👤 **Kalyx PIC:** {stop['pic_name']}")
-    st.markdown(f"📍 **Address:** {stop['address']}")
+    st.markdown(f"📍 **Area:** {stop['area']} | **Address:** {stop['address']}")
     
     items = []
     if stop["box"] > 0: items.append(f"📦 {int(stop['box'])} Box")
