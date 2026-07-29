@@ -10,7 +10,7 @@ import gspread
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- NEW IMPORTS FOR GOOGLE OR-TOOLS ---
+# --- GOOGLE OR-TOOLS IMPORTS ---
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
@@ -24,11 +24,10 @@ SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?fo
 SHEET_NAME = "Despatch"
 
 # --- PRESET START & END LOCATIONS (WITH GPS COORDINATES) ---
-# Coordinates are formatted as (Longitude, Latitude) for OSRM API
 PRESET_LOCATIONS = {
     "Kalyx Consultants Sdn Bhd (Office)": {
         "label": "🏢 Kalyx Consultants (Icon City)",
-        "coords": (100.4435, 5.3456)  # Approx Icon City, Bukit Mertajam
+        "coords": (100.4435, 5.3456)
     },
     "Machang Bubok (Home)": {
         "label": "🏠 Machang Bubok (Home)",
@@ -192,8 +191,6 @@ def mark_row_completed_in_sheets(row_idx):
 # --- 5. GPS GEOCODING & OR-TOOLS OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_coordinates(address):
-    """Converts a text address into GPS (Longitude, Latitude) using free OpenStreetMap"""
-    # Append Penang to ensure it stays local
     search_query = f"{address}, Penang, Malaysia"
     url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(search_query)}&format=json&limit=1"
     headers = {"User-Agent": "KalyxDespatchApp/1.0"}
@@ -208,7 +205,6 @@ def get_coordinates(address):
     return None
 
 def get_osrm_matrix(coords_list):
-    """Fetches real driving durations (seconds) between all points using OSRM"""
     coords_str = ";".join([f"{lon},{lat}" for lon, lat in coords_list])
     url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=duration"
     try:
@@ -221,11 +217,9 @@ def get_osrm_matrix(coords_list):
     return None
 
 def optimize_route_osrm(stops_list, start_key, end_key):
-    """Uses Google OR-Tools AI to find the fastest physical road route"""
     start_coords = PRESET_LOCATIONS[start_key]["coords"]
     end_coords = PRESET_LOCATIONS[end_key]["coords"]
     
-    # 1. Geocode all addresses
     valid_stops = []
     unmapped_stops = []
     
@@ -235,7 +229,7 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     for i, stop in enumerate(stops_list):
         status_text.text(f"Geocoding {i+1}/{len(stops_list)}: {stop['company']}...")
         coords = get_coordinates(stop["address"])
-        time_module.sleep(1) # Be nice to the free Nominatim API server (1 req/sec)
+        time_module.sleep(1)
         
         if coords:
             stop["coords"] = coords
@@ -249,13 +243,10 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     progress_bar.empty()
 
     if not valid_stops:
-        # If absolutely nothing geocoded, just return the raw list
         return unmapped_stops
 
-    # 2. Build the coordinate list: [START, ...STOPS..., END]
     all_coords = [start_coords] + [s["coords"] for s in valid_stops] + [end_coords]
     
-    # 3. Get real road driving matrix
     status_text.text("Calculating Penang road traffic routes...")
     time_matrix = get_osrm_matrix(all_coords)
     status_text.empty()
@@ -264,7 +255,6 @@ def optimize_route_osrm(stops_list, start_key, end_key):
         st.warning("⚠️ Could not connect to OSRM road network. Falling back to default sorting.")
         return valid_stops + unmapped_stops
 
-    # 4. Google OR-Tools Setup
     num_locations = len(all_coords)
     start_index = 0
     end_index = num_locations - 1
@@ -275,7 +265,6 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        # OR-Tools requires integers
         return int(time_matrix[from_node][to_node])
 
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
@@ -284,23 +273,20 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 
-    # 5. Solve for the fastest physical route!
     solution = routing.SolveWithParameters(search_parameters)
 
     optimized_stops = []
     if solution:
         index = routing.Start(0)
-        index = solution.Value(routing.NextVar(index)) # Skip Start Point
+        index = solution.Value(routing.NextVar(index))
         
         while not routing.IsEnd(index):
             node_index = manager.IndexToNode(index)
-            # Subtract 1 because valid_stops array doesn't include the Start point
             optimized_stops.append(valid_stops[node_index - 1])
             index = solution.Value(routing.NextVar(index))
     else:
         optimized_stops = valid_stops
 
-    # Append any unmapped stops to the end so they aren't lost
     return optimized_stops + unmapped_stops
 
 
@@ -410,16 +396,67 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            # Run the new AI Optimization
             with st.spinner("Analyzing maps and traffic constraints..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
             
+            # Go to preview page instead of direct route execution
+            st.session_state.page = "preview"
+            st.rerun()
+
+
+# --- 7. UI PAGE: ROUTE PREVIEW & MANUAL ADJUSTMENT ---
+elif st.session_state.page == "preview":
+    st.title("🗺️ Route Preview & Reordering")
+    st.caption("Review your AI-optimized route below. Use the ⬆️ and ⬇️ buttons to manually move stops if needed.")
+    
+    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
+    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
+    st.info(f"🚩 **Start Point:** {start_label}  \n🏁 **End Point:** {end_label}")
+    st.markdown("---")
+
+    route_list = st.session_state.optimized_route
+    total_stops = len(route_list)
+
+    for i, stop in enumerate(route_list):
+        transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
+        
+        c_move, c_info = st.columns([0.22, 0.78])
+        
+        with c_move:
+            st.markdown(f"**Stop #{i + 1}**")
+            col_u, col_d = st.columns(2)
+            with col_u:
+                if i > 0:
+                    if st.button("⬆️", key=f"up_{i}"):
+                        route_list[i], route_list[i-1] = route_list[i-1], route_list[i]
+                        st.rerun()
+            with col_d:
+                if i < total_stops - 1:
+                    if st.button("⬇️", key=f"down_{i}"):
+                        route_list[i], route_list[i+1] = route_list[i+1], route_list[i]
+                        st.rerun()
+                        
+        with c_info:
+            st.markdown(
+                f"<b>{stop['company']}</b> {transport_icon} {stop['kpi_badge_html']}<br>"
+                f"<small>📍 {stop['address']}</small>", 
+                unsafe_allow_html=True
+            )
+        st.markdown("---")
+
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("⬅️ Re-select Tasks", use_container_width=True):
+            st.session_state.page = "setup"
+            st.rerun()
+    with col_btn2:
+        if st.button("🚀 Start Live Route", type="primary", use_container_width=True):
             st.session_state.current_stop = 0
             st.session_state.page = "route"
             st.rerun()
 
 
-# --- 7. UI PAGE: ROUTE DISPLAY & EXECUTION ---
+# --- 8. UI PAGE: ROUTE DISPLAY & EXECUTION ---
 elif st.session_state.page == "route":
     total_stops = len(st.session_state.optimized_route)
     current_idx = st.session_state.current_stop
@@ -429,7 +466,7 @@ elif st.session_state.page == "route":
     with col_nav_top:
         opt_time_str = st.session_state.optimization_time.strftime("%I:%M %p") if st.session_state.optimization_time else ""
         st.markdown(f"### 🏁 Stop {current_idx + 1} of {total_stops}")
-        st.caption(f"Optimized at {opt_time_str} via OR-Tools")
+        st.caption(f"Optimized at {opt_time_str}")
     with col_home:
         if st.button("🏠 Home", key="btn_home_route", use_container_width=True):
             st.session_state.page = "setup"
@@ -443,9 +480,8 @@ elif st.session_state.page == "route":
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
     st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
     
-    # Alert if the address couldn't be found by GPS
     if "coords" not in stop:
-        st.warning("⚠️ **GPS Warning:** This address couldn't be automatically mapped. It has been moved to the end of your route.")
+        st.warning("⚠️ **GPS Warning:** This address couldn't be automatically mapped. It has been placed in your route.")
 
     st.markdown("---")
 
@@ -510,7 +546,7 @@ elif st.session_state.page == "route":
                 st.error("❌ Failed to update Google Sheets. Check your internet connection and try again.")
 
 
-# --- 8. UI PAGE: SHIFT COMPLETED ---
+# --- 9. UI PAGE: SHIFT COMPLETED ---
 elif st.session_state.page == "finished":
     st.balloons()
     st.title("🎉 All Tasks Completed!")
