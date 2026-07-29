@@ -3,5 +3,6 @@ pandas
 openpyxl
 requests
 gspread
-gspread-formatting
+gspread_formatting
 oauth2client
+ortools
