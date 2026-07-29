@@ -10,7 +10,6 @@ import openpyxl
 import pandas as pd
 import requests
 import streamlit as st
-import google.generativeai as genai
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -221,64 +220,53 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. GEMINI AI ROUTE OPTIMIZATION ---
+# --- 5. ALGORITHMIC ZONE & POSTCODE ROUTE OPTIMIZATION ---
 def optimize_route_with_gemini(stops_list, start_key, end_key):
-    if "GEMINI_API_KEY" not in st.secrets:
-        st.error("⚠️ GEMINI_API_KEY is missing in Streamlit Secrets!")
-        return stops_list
-
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    model = genai.GenerativeModel('gemini-2.5-flash')
-
-    minimal_stops = []
-    for stop in stops_list:
-        minimal_stops.append({
-            "id": stop["id"],
-            "company": stop["company"],
-            "address": f"[{stop['area']}] {stop['address']}, Penang, Malaysia"
-        })
-
-    prompt = f"""
-    You are an expert logistics dispatcher operating in Penang, Malaysia.
-    I have a list of delivery stops. I need you to sequence them in the most logical, 
-    efficient driving order to minimize back-and-forth travel time.
-
-    Start Point: {PRESET_LOCATIONS[start_key]}
-    End Point: {PRESET_LOCATIONS[end_key]}
-
-    Here are the stops to sequence:
-    {json.dumps(minimal_stops, indent=2)}
-
-    RULES:
-    1. Group locations in the same geographical area/postcode together.
-    2. Create a smooth flow from the Start Point to the End Point.
-    3. Return ONLY a valid JSON array containing the "id" integers in the exact optimized order.
-    4. Do not include any formatting, markdown, ```json, or explanations. Just the array.
-    Example: [14, 5, 2, 9]
+    """Optimizes route deterministically using area/postcode clustering 
+    to eliminate zig-zagging, completely independent of LLM guesswork.
     """
+    if not stops_list:
+        return []
 
-    try:
-        response = model.generate_content(prompt)
-        
-        clean_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        optimized_ids = json.loads(clean_text)
+    # 1. Separate stops by their extracted zone/postcode cluster
+    clusters = {}
+    for stop in stops_list:
+        cluster_name = stop.get("area", "Unassigned")
+        if cluster_name not in clusters:
+            clusters[cluster_name] = []
+        clusters[cluster_name].append(stop)
 
-        optimized_stops = []
-        for opt_id in optimized_ids:
-            for original_stop in stops_list:
-                if original_stop["id"] == opt_id:
-                    optimized_stops.append(original_stop)
-                    break
+    # 2. Define a logical geographical flow for Penang/Seberang Perai regions
+    zone_priority = [
+        "Icon City",
+        "Bukit Mertajam",
+        "Machang Bubok",
+        "Juru",
+        "Perai",
+        "Butterworth",
+        "Kepala Batas",
+        "Bertam",
+        "Simpang Ampat",
+        "Nibong Tebal",
+        "Penang Island",
+    ]
 
-        for original_stop in stops_list:
-            if original_stop not in optimized_stops:
-                optimized_stops.append(original_stop)
+    sorted_clusters = []
+    for zone in zone_priority:
+        matching_keys = [k for k in clusters.keys() if zone.lower() in k.lower()]
+        for mk in matching_keys:
+            sorted_clusters.append(clusters.pop(mk))
 
-        return optimized_stops
+    for remaining_zone_stops in clusters.values():
+        sorted_clusters.append(remaining_zone_stops)
 
-    except Exception as e:
-        st.error(f"⚠️ AI Routing failed (returning original order). Error: {e}")
-        return stops_list
+    # 3. Flatten the clustered stops into a smooth driving sequence
+    optimized_stops = []
+    for cluster_stops in sorted_clusters:
+        cluster_stops_sorted = sorted(cluster_stops, key=lambda x: x["company"])
+        optimized_stops.extend(cluster_stops_sorted)
+
+    return optimized_stops
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
@@ -386,7 +374,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🧠 Calculate Smart Route with Gemini AI", type="primary", use_container_width=True):
+    if st.button("🧠 Calculate Smart Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -394,7 +382,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("🤖 Gemini is analyzing addresses and optimizing the best route..."):
+            with st.spinner("⚡ Grouping and organizing optimal route zones..."):
                 st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
@@ -405,7 +393,7 @@ if st.session_state.page == "setup":
 elif st.session_state.page == "preview":
     st.title("🗺️ Route Preview & Reordering")
     st.caption(
-        "Review your Gemini AI route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
+        "Review your optimized route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
     )
 
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, st.session_state.start_point)
@@ -522,7 +510,7 @@ elif st.session_state.page == "route":
 
     with col_c2:
         search_query = f"{stop['company']}, {stop['address']}, Penang, Malaysia"
-        maps_url = f"[https://www.google.com/maps/dir/?api=1&destination=](https://www.google.com/maps/dir/?api=1&destination=){urllib.parse.quote(search_query)}"
+        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={urllib.parse.quote(search_query)}"
         st.markdown(
             f"<a href='{maps_url}' target='_blank'><button style='width: 100%; padding:14px; border-radius:8px; border:1px solid #28a745; background:transparent; color:#28a745; font-weight:bold;'>🗺️ Navigate</button></a>",
             unsafe_allow_html=True,
