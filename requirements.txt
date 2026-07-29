@@ -5,5 +5,5 @@ requests
 gspread
 gspread_formatting
 oauth2client
-ortools
+ortools==9.9.3963
 google-generativeai
