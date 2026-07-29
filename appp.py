@@ -1,4 +1,6 @@
 import io
+import time as time_module
+import urllib.parse
 from datetime import datetime, timedelta, time
 import pandas as pd
 import openpyxl
@@ -7,6 +9,10 @@ import streamlit as st
 import gspread
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
+
+# --- NEW IMPORTS FOR GOOGLE OR-TOOLS ---
+from ortools.constraint_solver import routing_enums_pb2
+from ortools.constraint_solver import pywrapcp
 
 st.set_page_config(
     page_title="Kalyx Despatch Terminal", page_icon="🏍️", layout="centered"
@@ -17,22 +23,20 @@ SHEET_ID = "1YZgwm11scCWdiH5-9RxBVe3kEk9obfNtlH4frIYZGSg"
 SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=xlsx"
 SHEET_NAME = "Despatch"
 
-# --- PRESET START & END LOCATIONS ---
+# --- PRESET START & END LOCATIONS (WITH GPS COORDINATES) ---
+# Coordinates are formatted as (Longitude, Latitude) for OSRM API
 PRESET_LOCATIONS = {
     "Kalyx Consultants Sdn Bhd (Office)": {
-        "label": "🏢 Kalyx Consultants Sdn Bhd (Office)",
-        "address": "Kalyx Consultants Sdn Bhd, Bukit Mertajam",
-        "score": 120
+        "label": "🏢 Kalyx Consultants (Icon City)",
+        "coords": (100.4435, 5.3456)  # Approx Icon City, Bukit Mertajam
     },
     "Machang Bubok (Home)": {
         "label": "🏠 Machang Bubok (Home)",
-        "address": "Machang Bubok, Bukit Mertajam",
-        "score": 140
+        "coords": (100.5100, 5.3300) 
     },
     "Taman Sri Serdang, Bertam (Home)": {
         "label": "🏠 Taman Sri Serdang, Bertam (Home)",
-        "address": "Taman Sri Serdang, Bertam, Kepala Batas",
-        "score": 0
+        "coords": (100.4480, 5.5180) 
     }
 }
 
@@ -53,12 +57,6 @@ if "end_point" not in st.session_state:
 
 # --- 2. KPI AGING CALCULATION LOGIC ---
 def calculate_kpi_status(raw_request_date):
-    """
-    Calculates effective request date using 9:30 AM cut-off logic:
-    - Before 9:30 AM -> Same day request
-    - After 9:30 AM -> Next day request
-    Returns days elapsed, status label, badge HTML, and red status flag.
-    """
     now = datetime.now()
     req_dt = None
     
@@ -73,7 +71,6 @@ def calculate_kpi_status(raw_request_date):
     if not req_dt:
         req_dt = now
 
-    # 9:30 AM Cut-off logic
     if req_dt.time() > time(9, 30):
         effective_date = req_dt.date() + timedelta(days=1)
     else:
@@ -171,10 +168,10 @@ def load_pending_despatch_tasks():
     return pending_tasks
 
 
-# --- 4. GOOGLE SHEETS WRITEBACK (WITH OFFLINE ERROR CATCHING) ---
+# --- 4. GOOGLE SHEETS WRITEBACK ---
 def mark_row_completed_in_sheets(row_idx):
     if "gcp_service_account" not in st.secrets:
-        return False
+        return "no_secrets"
         
     try:
         credentials = ServiceAccountCredentials.from_json_keyfile_dict(
@@ -188,73 +185,128 @@ def mark_row_completed_in_sheets(row_idx):
         fmt = cellFormat(backgroundColor=color(1.0, 0.65, 0.0))
         format_cell_range(worksheet, f"A{row_idx}:AM{row_idx}", fmt)
         return True
-    except requests.exceptions.RequestException:
-        st.error("📡 Network error: No internet connection. Please check your signal and try clicking again.")
+    except Exception:
         return False
+
+
+# --- 5. GPS GEOCODING & OR-TOOLS OPTIMIZATION ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_coordinates(address):
+    """Converts a text address into GPS (Longitude, Latitude) using free OpenStreetMap"""
+    # Append Penang to ensure it stays local
+    search_query = f"{address}, Penang, Malaysia"
+    url = f"https://nominatim.openstreetmap.org/search?q={urllib.parse.quote(search_query)}&format=json&limit=1"
+    headers = {"User-Agent": "KalyxDespatchApp/1.0"}
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200 and len(resp.json()) > 0:
+            data = resp.json()[0]
+            return (float(data["lon"]), float(data["lat"]))
+    except:
+        pass
+    return None
+
+def get_osrm_matrix(coords_list):
+    """Fetches real driving durations (seconds) between all points using OSRM"""
+    coords_str = ";".join([f"{lon},{lat}" for lon, lat in coords_list])
+    url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=duration"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("code") == "Ok":
+            return data["durations"]
     except Exception as e:
-        st.error(f"Error updating Google Sheet: {e}")
-        return False
+        print(f"OSRM Error: {e}")
+    return None
 
+def optimize_route_osrm(stops_list, start_key, end_key):
+    """Uses Google OR-Tools AI to find the fastest physical road route"""
+    start_coords = PRESET_LOCATIONS[start_key]["coords"]
+    end_coords = PRESET_LOCATIONS[end_key]["coords"]
+    
+    # 1. Geocode all addresses
+    valid_stops = []
+    unmapped_stops = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, stop in enumerate(stops_list):
+        status_text.text(f"Geocoding {i+1}/{len(stops_list)}: {stop['company']}...")
+        coords = get_coordinates(stop["address"])
+        time_module.sleep(1) # Be nice to the free Nominatim API server (1 req/sec)
+        
+        if coords:
+            stop["coords"] = coords
+            valid_stops.append(stop)
+        else:
+            unmapped_stops.append(stop)
+            
+        progress_bar.progress((i + 1) / len(stops_list))
+    
+    status_text.empty()
+    progress_bar.empty()
 
-# --- 5. LOCATION SCORING & SPOKE-STYLE NEAREST NEIGHBOR TSP ROUTING ---
-def get_location_score(address):
-    addr = str(address).lower()
-    if "bertam" in addr or "serdang" in addr or "kepala batas" in addr: return 0
-    elif "perai jaya" in addr: return 10
-    elif "pauh" in addr: return 20
-    elif "seberang jaya" in addr or "todak" in addr: return 30
-    elif "chain ferry" in addr: return 40
-    elif "ong yi how" in addr or "teras" in addr: return 50
-    elif "selayang" in addr or "sungai dua" in addr: return 60
-    elif "jawi" in addr or "valdor" in addr: return 80
-    elif "simpang ampat" in addr or "hijauan hills" in addr: return 85
-    elif "teguh" in addr or "tinggi" in addr: return 90
-    elif "bukit minyak" in addr: return 100
-    elif "juru" in addr: return 110
-    elif "bukit kecil" in addr or "perda" in addr or "kalyx" in addr: return 120
-    elif "maju jaya" in addr: return 130
-    elif "machang bubok" in addr or "macang bubok" in addr: return 140
-    else: return 100
+    if not valid_stops:
+        # If absolutely nothing geocoded, just return the raw list
+        return unmapped_stops
 
-def optimize_route(stops_list, start_key, end_key):
-    start_score = PRESET_LOCATIONS.get(start_key, {}).get("score", 120)
-    end_score = PRESET_LOCATIONS.get(end_key, {}).get("score", 120)
+    # 2. Build the coordinate list: [START, ...STOPS..., END]
+    all_coords = [start_coords] + [s["coords"] for s in valid_stops] + [end_coords]
+    
+    # 3. Get real road driving matrix
+    status_text.text("Calculating Penang road traffic routes...")
+    time_matrix = get_osrm_matrix(all_coords)
+    status_text.empty()
+    
+    if not time_matrix:
+        st.warning("⚠️ Could not connect to OSRM road network. Falling back to default sorting.")
+        return valid_stops + unmapped_stops
 
-    for s in stops_list:
-        s["score"] = get_location_score(s["address"])
+    # 4. Google OR-Tools Setup
+    num_locations = len(all_coords)
+    start_index = 0
+    end_index = num_locations - 1
+    
+    manager = pywrapcp.RoutingIndexManager(num_locations, 1, [start_index], [end_index])
+    routing = pywrapcp.RoutingModel(manager)
 
-    # Overdue and fixed-time stops take precedence
-    priority_stops = [s for s in stops_list if s.get("is_red_overdue") or s.get("custom_time")]
-    normal_stops = [s for s in stops_list if not s.get("is_red_overdue") and not s.get("custom_time")]
+    def time_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        # OR-Tools requires integers
+        return int(time_matrix[from_node][to_node])
 
-    priority_stops.sort(key=lambda x: (
-        0 if x.get("is_red_overdue") else 1, 
-        x.get("custom_time").hour * 60 + x.get("custom_time").minute if x.get("custom_time") else 0
-    ))
+    transit_callback_index = routing.RegisterTransitCallback(time_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # Nearest Neighbor Chain calculation for smooth A -> B -> C -> D -> E progression
-    unvisited = list(normal_stops)
-    current_pos = start_score
-    optimized_normal = []
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 
-    while unvisited:
-        best_next = min(
-            unvisited, 
-            key=lambda s: (
-                abs(s["score"] - current_pos), 
-                abs(s["score"] - end_score)
-            )
-        )
-        optimized_normal.append(best_next)
-        current_pos = best_next["score"]
-        unvisited.remove(best_next)
+    # 5. Solve for the fastest physical route!
+    solution = routing.SolveWithParameters(search_parameters)
 
-    return priority_stops + optimized_normal
+    optimized_stops = []
+    if solution:
+        index = routing.Start(0)
+        index = solution.Value(routing.NextVar(index)) # Skip Start Point
+        
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            # Subtract 1 because valid_stops array doesn't include the Start point
+            optimized_stops.append(valid_stops[node_index - 1])
+            index = solution.Value(routing.NextVar(index))
+    else:
+        optimized_stops = valid_stops
+
+    # Append any unmapped stops to the end so they aren't lost
+    return optimized_stops + unmapped_stops
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
 if st.session_state.page == "setup":
-    st.title("🏍️ Kalyx Despatch Route Planner")
+    st.title("🏍️ Kalyx AI Despatch Route Planner")
     
     with st.spinner("Fetching live pending tasks..."):
         try:
@@ -350,16 +402,18 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🚀 Optimize & Start Loop", type="primary", use_container_width=True):
+    if st.button("🚀 Calculate AI Road Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
-            realtime_now = datetime.now()
-            st.session_state.optimization_time = realtime_now
+            st.session_state.optimization_time = datetime.now()
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            st.session_state.optimized_route = optimize_route(selected_stops, sel_start, sel_end)
+            # Run the new AI Optimization
+            with st.spinner("Analyzing maps and traffic constraints..."):
+                st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
+            
             st.session_state.current_stop = 0
             st.session_state.page = "route"
             st.rerun()
@@ -375,7 +429,7 @@ elif st.session_state.page == "route":
     with col_nav_top:
         opt_time_str = st.session_state.optimization_time.strftime("%I:%M %p") if st.session_state.optimization_time else ""
         st.markdown(f"### 🏁 Stop {current_idx + 1} of {total_stops}")
-        st.caption(f"Optimized at {opt_time_str}")
+        st.caption(f"Optimized at {opt_time_str} via OR-Tools")
     with col_home:
         if st.button("🏠 Home", key="btn_home_route", use_container_width=True):
             st.session_state.page = "setup"
@@ -388,6 +442,11 @@ elif st.session_state.page == "route":
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
     st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
+    
+    # Alert if the address couldn't be found by GPS
+    if "coords" not in stop:
+        st.warning("⚠️ **GPS Warning:** This address couldn't be automatically mapped. It has been moved to the end of your route.")
+
     st.markdown("---")
 
     transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
@@ -421,7 +480,7 @@ elif st.session_state.page == "route":
             st.write(f"📞 Client Contact: {stop['client']} (No phone)")
             
     with col_c2:
-        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={stop['address'].replace(' ', '+')}"
+        maps_url = f"https://www.google.com/maps/dir/?api=1&destination={urllib.parse.quote(stop['address'])}"
         st.markdown(
             f"<a href='{maps_url}' target='_blank'><button style='width: 100%; padding:14px; border-radius:8px; border:1px solid #28a745; background:transparent; color:#28a745; font-weight:bold;'>🗺️ Navigate</button></a>", 
             unsafe_allow_html=True
@@ -433,11 +492,22 @@ elif st.session_state.page == "route":
     if st.button("✅ Mark Complete & Show Next Job", type="primary", use_container_width=True):
         with st.spinner("Updating Google Sheets..."):
             success = mark_row_completed_in_sheets(stop["id"])
-            if success:
+            
+            if success == "no_secrets":
+                st.warning("⚠️ Google Sheets API not connected yet. Moving to next job in the app only.")
                 st.session_state.current_stop += 1
                 if st.session_state.current_stop >= total_stops:
                     st.session_state.page = "finished"
                 st.rerun()
+                
+            elif success == True:
+                st.session_state.current_stop += 1
+                if st.session_state.current_stop >= total_stops:
+                    st.session_state.page = "finished"
+                st.rerun()
+                
+            else:
+                st.error("❌ Failed to update Google Sheets. Check your internet connection and try again.")
 
 
 # --- 8. UI PAGE: SHIFT COMPLETED ---
