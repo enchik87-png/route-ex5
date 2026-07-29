@@ -6,11 +6,13 @@ import time as time_module
 import urllib.parse
 from datetime import datetime, timedelta, time
 
+import folium
 import gspread
 import openpyxl
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_folium import st_folium
 from gspread_formatting import cellFormat, color, format_cell_range
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -30,39 +32,51 @@ PRESET_LOCATIONS = {
     "Taman Sri Serdang, Bertam (Home)": "🏠 Taman Sri Serdang, Bertam, Kepala Batas",
 }
 
-# --- PENANG MAINLAND POSTCODE & SUB-AREA GPS (Strict South-to-North Latitudes) ---
-PENANG_POSTCODE_GPS = {
-    "14300": (5.170, 100.480),  # Nibong Tebal (Southmost)
-    "14200": (5.220, 100.490),  # Sungai Bakap
-    "14400": (5.200, 100.500),  # Valdor
-    "14110": (5.250, 100.440),  # Batu Kawan / Bandar Cassia
-    "14120": (5.280, 100.480),  # Simpang Ampat (Villa Begonia / Hijauan Hills)
-    # 14100 Sub-areas (South to North)
-    "14100_serijuru": (5.290, 100.430),
-    "14100_tambun": (5.300, 100.440),
-    "14100_bukitminyak": (5.310, 100.450),
-    "14100": (5.305, 100.445),
-    # 14000 Sub-areas (South to North: Juru -> Permatang Tinggi / Teguh -> BM Town)
-    "14000_juru": (5.330, 100.435),
-    "14000_teguh": (5.340, 100.450),
-    "14000_bm": (5.355, 100.465),
-    "14000": (5.350, 100.460),
-    # Northward Postcodes
-    "13600": (5.360, 100.390),  # Perai
-    "13500": (5.372, 100.410),  # Permatang Pauh / Elevate
-    "13700": (5.390, 100.400),  # Seberang Jaya
-    "13000": (5.412, 100.370),  # Butterworth
-    "13020": (5.418, 100.380),  # Butterworth / Selayang Indah
-    "13400": (5.420, 100.380),  # Butterworth / Bagan / Mak Mandin
-    "13800": (5.445, 100.430),  # Sungai Dua / Kampung Teluk / Sungai Lokan
-    "13300": (5.480, 100.480),  # Tasek Gelugor
-    "13200": (5.515, 100.430),  # Kepala Batas / Bertam (Northmost)
-}
-
 PRESET_COORDS = {
     "Kalyx Consultants Sdn Bhd (Office)": (5.343, 100.433),
     "Machang Bubok (Home)": (5.338, 100.508),
     "Taman Sri Serdang, Bertam (Home)": (5.518, 100.440)
+}
+
+# --- PENANG FULL REGION POSTCODE & SUB-AREA GPS ---
+PENANG_POSTCODE_GPS = {
+    # --- PENANG ISLAND (North to South Sweep: 10xxx & 11xxx) ---
+    "10000": (5.416, 100.332),  # George Town
+    "10150": (5.420, 100.315),  # Pulau Tikus
+    "10250": (5.435, 100.300),  # Tanjung Tokong
+    "10350": (5.455, 100.300),  # Tanjung Bungah
+    "11200": (5.470, 100.270),  # Batu Ferringhi
+    "11400": (5.405, 100.280),  # Air Itam / Farlim
+    "11500": (5.385, 100.280),  # Paya Terubong
+    "11600": (5.390, 100.310),  # Jelutong
+    "11700": (5.355, 100.300),  # Gelugor / USM
+    "11900": (5.320, 100.280),  # Bayan Lepas / Bayan Baru
+    "11950": (5.290, 100.260),  # Teluk Kumbar
+    "11000": (5.350, 100.240),  # Balik Pulau
+
+    # --- MAINLAND SOUTH TO NORTH (13xxx & 14xxx) ---
+    "14300": (5.170, 100.480),  # Nibong Tebal
+    "14200": (5.220, 100.490),  # Sungai Bakap
+    "14400": (5.200, 100.500),  # Valdor
+    "14110": (5.250, 100.440),  # Batu Kawan
+    "14120": (5.280, 100.480),  # Simpang Ampat
+    "14100_serijuru": (5.290, 100.430),
+    "14100_tambun": (5.300, 100.440),
+    "14100_bukitminyak": (5.310, 100.450),
+    "14100": (5.305, 100.445),
+    "14000_juru": (5.330, 100.435),
+    "14000_teguh": (5.340, 100.450),
+    "14000_bm": (5.350, 100.460),
+    "14000": (5.350, 100.460),
+    "13500": (5.358, 100.410),  # Permatang Pauh / Pauh Jaya
+    "13600": (5.365, 100.390),  # Perai
+    "13700": (5.390, 100.400),  # Seberang Jaya
+    "13000": (5.412, 100.370),  # Butterworth
+    "13020": (5.418, 100.380),  # Butterworth / Selayang Indah
+    "13400": (5.420, 100.380),  # Butterworth / Bagan
+    "13800": (5.445, 100.430),  # Sungai Dua
+    "13300": (5.480, 100.480),  # Tasek Gelugor
+    "13200": (5.515, 100.430),  # Kepala Batas
 }
 
 
@@ -145,7 +159,9 @@ def get_cluster_key(raw_area, address):
     combined_text = f"{str(raw_area)} {str(address)}"
     postcode_match = re.search(r"\b(\d{5})\b", combined_text)
     if postcode_match:
-        return f"Postcode {postcode_match.group(1)}"
+        pc = postcode_match.group(1)
+        region = "Island" if pc.startswith(("10", "11")) else "Mainland"
+        return f"[{region}] Postcode {pc}"
     cleaned = _normalize_area_name(raw_area)
     if cleaned:
         return f"Area: {cleaned}"
@@ -257,9 +273,8 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. MICRO-AREA STREET LEVEL SOUTH-TO-NORTH SWEEP ROUTING ---
+# --- 5. ROUTING & MAP RENDERING ---
 def get_stop_coords(stop):
-    """Extracts 5-digit postcode and checks sub-area keywords for micro-sorting."""
     combined_text = f"{stop.get('area', '')} {stop.get('address', '')}".lower()
     match = re.search(r"\b(1\d{4})\b", combined_text)
     
@@ -282,23 +297,56 @@ def get_stop_coords(stop):
         elif pc in PENANG_POSTCODE_GPS:
             return PENANG_POSTCODE_GPS[pc]
 
-    return (5.350, 100.450)  # Default fallback centroid
+    return (5.350, 100.350)
 
 def optimize_route_with_gemini(stops_list, start_key, end_key):
-    """Deterministically sorts stops in a strict South-to-North direction
-
-    with micro-neighborhood granularity to completely eliminate backtracking.
-    """
     if not stops_list:
         return []
-
-    # Sort strictly by micro-latitude ascending (South to North)
     sorted_stops = sorted(
         stops_list, 
         key=lambda s: (get_stop_coords(s)[0], s.get("company", ""))
     )
-
     return sorted_stops
+
+def render_interactive_map(route_list, start_key, end_key):
+    start_coords = PRESET_COORDS.get(start_key, (5.343, 100.433))
+    
+    # Center map around start point or first stop
+    m = folium.Map(location=start_coords, zoom_start=12, tiles="OpenStreetMap")
+
+    # Start Point Marker
+    folium.Marker(
+        location=start_coords,
+        popup=f"<b>START:</b> {start_key}",
+        icon=folium.Icon(color="green", icon="play", prefix="fa")
+    ).add_to(m)
+
+    coord_points = [start_coords]
+
+    for i, stop in enumerate(route_list):
+        coords = get_stop_coords(stop)
+        coord_points.append(coords)
+        
+        popup_html = f"<b>Stop #{i+1}: {stop['company']}</b><br>{stop['address']}"
+        folium.Marker(
+            location=coords,
+            popup=popup_html,
+            tooltip=f"#{i+1}: {stop['company']}",
+            icon=folium.DivIcon(html=f"""
+                <div style="background-color: #1E90FF; color: white; border-radius: 50%; 
+                            width: 24px; height: 24px; display: flex; align-items: center; 
+                            justify-content: center; font-weight: bold; font-size: 11px; 
+                            border: 2px solid white; box-shadow: 0px 2px 4px rgba(0,0,0,0.3);">
+                    {i+1}
+                </div>
+            """)
+        ).add_to(m)
+
+    # Draw connecting polyline path
+    if len(coord_points) > 1:
+        folium.PolyLine(coord_points, color="#1E90FF", weight=4, opacity=0.8).add_to(m)
+
+    st_folium(m, height=350, use_container_width=True)
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
@@ -396,8 +444,6 @@ if st.session_state.page == "setup":
         st.markdown("---")
 
     st.markdown("### 🗺️ Route Endpoints & Optimization")
-    st.caption("Select your starting point and final destination for today's run:")
-
     col_sp, col_ep = st.columns(2)
     options_keys = list(PRESET_LOCATIONS.keys())
 
@@ -414,23 +460,25 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("⚡ Processing micro-area South-to-North routing..."):
+            with st.spinner("⚡ Processing Penang routing & map generation..."):
                 st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
             st.rerun()
 
 
-# --- 7. UI PAGE: ROUTE PREVIEW & MANUAL ADJUSTMENT ---
+# --- 7. UI PAGE: ROUTE PREVIEW & MAP ---
 elif st.session_state.page == "preview":
-    st.title("🗺️ Route Preview & Reordering")
-    st.caption(
-        "Review your optimized route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed."
-    )
+    st.title("🗺️ Route Preview & Map")
+    st.caption("Review your optimized route sequence and visual map below.")
 
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, st.session_state.start_point)
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, st.session_state.end_point)
-    st.info(f"🚩 **Start Point:** {start_label}  \n🏁 **End Point:** {end_label}")
+    st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
+
+    # Render In-App Map
+    st.markdown("#### 🗺️ Route Overview Map")
+    render_interactive_map(st.session_state.optimized_route, st.session_state.start_point, st.session_state.end_point)
     st.markdown("---")
 
     route_list = st.session_state.optimized_route
@@ -438,7 +486,6 @@ elif st.session_state.page == "preview":
 
     for i, stop in enumerate(route_list):
         transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
-
         c_move, c_info = st.columns([0.22, 0.78])
 
         with c_move:
@@ -473,7 +520,7 @@ elif st.session_state.page == "preview":
             st.rerun()
 
 
-# --- 8. UI PAGE: ROUTE DISPLAY & EXECUTION ---
+# --- 8. UI PAGE: LIVE ROUTE EXECUTION ---
 elif st.session_state.page == "route":
     total_stops = len(st.session_state.optimized_route)
     current_idx = st.session_state.current_stop
@@ -496,10 +543,6 @@ elif st.session_state.page == "route":
             st.rerun()
 
     st.progress((current_idx + 1) / total_stops)
-
-    start_label = PRESET_LOCATIONS.get(st.session_state.start_point, st.session_state.start_point)
-    end_label = PRESET_LOCATIONS.get(st.session_state.end_point, st.session_state.end_point)
-    st.info(f"🚩 **Start:** {start_label}  \n🏁 **End:** {end_label}")
     st.markdown("---")
 
     transport_icon = "🚗" if "car" in str(stop["transport"]).lower() else "🏍️"
@@ -549,8 +592,6 @@ elif st.session_state.page == "route":
         )
 
     st.write("")
-    st.write("")
-
     if st.button("✅ Mark Complete & Show Next Job", type="primary", use_container_width=True):
         with st.spinner("Updating Google Sheets..."):
             success = mark_row_completed_in_sheets(stop["id"])
