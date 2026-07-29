@@ -114,14 +114,11 @@ def _normalize_area_name(raw_area):
     return cleaned
 
 
-# --- STRICT POSTCODE-FIRST CLUSTERING HELPER ---
 def get_cluster_key(raw_area, address):
-    address_str = str(address)
-
-    postcode_match = re.search(r"\b(\d{5})\b", address_str)
+    combined_text = f"{str(raw_area)} {str(address)}"
+    postcode_match = re.search(r"\b(\d{5})\b", combined_text)
     if postcode_match:
         return f"Postcode {postcode_match.group(1)}"
-
     cleaned = _normalize_area_name(raw_area)
     if cleaned:
         return f"Area: {cleaned}"
@@ -147,7 +144,6 @@ def load_pending_despatch_tasks():
     wb = openpyxl.load_workbook(io.BytesIO(response.content), data_only=True)
     sheet = wb[SHEET_NAME]
     pending_tasks = []
-
     two_weeks_ago = datetime.now() - timedelta(days=14)
 
     for row_idx in range(2, sheet.max_row + 1):
@@ -179,11 +175,8 @@ def load_pending_despatch_tasks():
             address = cell_address.value
             company = sheet.cell(row=row_idx, column=17).value
 
-            if company and address and str(address).strip().lower() != "nan":
-                days_elapsed, kpi_status, badge_html, is_red, formatted_req_str = calculate_kpi_status(
-                    cell_date
-                )
-
+            if company:
+                days_elapsed, kpi_status, badge_html, is_red, formatted_req_str = calculate_kpi_status(cell_date)
                 raw_area = str(sheet.cell(row=row_idx, column=14).value or "Unassigned")
                 cluster_group = get_cluster_key(raw_area, str(address))
 
@@ -220,7 +213,6 @@ def load_pending_despatch_tasks():
 def mark_row_completed_in_sheets(row_idx):
     if "gcp_service_account" not in st.secrets:
         return "no_secrets"
-
     try:
         credentials = ServiceAccountCredentials.from_json_keyfile_dict(
             dict(st.secrets["gcp_service_account"]),
@@ -232,7 +224,6 @@ def mark_row_completed_in_sheets(row_idx):
         gc = gspread.authorize(credentials)
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.worksheet(SHEET_NAME)
-
         fmt = cellFormat(backgroundColor=color(1.0, 0.65, 0.0))
         format_cell_range(worksheet, f"A{row_idx}:AM{row_idx}", fmt)
         return True
@@ -240,13 +231,48 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. STRICT BLOCK-LOCKING ROUTE OPTIMIZATION ---
+# --- 5. DYNAMIC API SEARCH & STRICT BLOCK-LOCKING OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_coordinates(address):
-    search_query = f"{address}, Penang, Malaysia"
+def fetch_location_and_postcode(search_query):
+    """
+    Searches for the company or address, gets GPS coordinates, 
+    and dynamically extracts the official 5-digit postcode.
+    """
+    # 1. OPTIONAL: GOOGLE MAPS API (If you add a Key to Streamlit Secrets)
+    if "GOOGLE_MAPS_API_KEY" in st.secrets:
+        api_key = st.secrets["GOOGLE_MAPS_API_KEY"]
+        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={urllib.parse.quote(search_query)}&key={api_key}"
+        try:
+            resp = requests.get(url, timeout=8).json()
+            if resp.get("status") == "OK" and resp.get("results"):
+                result = resp["results"][0]
+                lat = result["geometry"]["location"]["lat"]
+                lon = result["geometry"]["location"]["lng"]
+                
+                postcode = None
+                for component in result.get("address_components", []):
+                    if "postal_code" in component.get("types", []):
+                        postcode = component["long_name"]
+                        break
+                
+                # Regex fallback on formatted address just in case
+                if not postcode:
+                    fmt_address = result.get("formatted_address", "")
+                    match = re.search(r"\b(\d{5})\b", fmt_address)
+                    if match:
+                        postcode = match.group(1)
+
+                if postcode:
+                    return lon, lat, f"Postcode {postcode}"
+                return lon, lat, None
+        except Exception:
+            pass
+
+    # 2. DEFAULT: FREE NOMINATIM OPENSTREETMAP SEARCH
+    # (Acts as a free fallback if no Google API Key is provided)
     url = (
         "https://nominatim.openstreetmap.org/search?"
-        f"q={urllib.parse.quote(search_query)}&format=json&limit=1"
+        f"q={urllib.parse.quote(search_query)}&format=json&addressdetails=1&limit=1"
     )
     headers = {"User-Agent": "KalyxDespatchApp/1.0"}
 
@@ -254,10 +280,26 @@ def get_coordinates(address):
         resp = requests.get(url, headers=headers, timeout=8)
         if resp.status_code == 200 and resp.json():
             data = resp.json()[0]
-            return (float(data["lon"]), float(data["lat"]))
+            lat = float(data["lat"])
+            lon = float(data["lon"])
+            
+            # Extract postcode explicitly from address data
+            postcode = data.get("address", {}).get("postcode")
+            
+            # If missing, scrape the full display text for a 5-digit number
+            if not postcode:
+                display_name = data.get("display_name", "")
+                match = re.search(r"\b(\d{5})\b", display_name)
+                if match:
+                    postcode = match.group(1)
+            
+            if postcode:
+                return lon, lat, f"Postcode {postcode}"
+            return lon, lat, None
     except Exception:
         pass
-    return None
+    
+    return None, None, None
 
 
 def _haversine_meters(coord_a, coord_b):
@@ -273,7 +315,6 @@ def _haversine_meters(coord_a, coord_b):
 
 def optimize_route_osrm(stops_list, start_key, end_key):
     start_coords = PRESET_LOCATIONS[start_key]["coords"]
-    end_coords = PRESET_LOCATIONS[end_key]["coords"]
 
     valid_stops = []
     unmapped_stops = []
@@ -282,12 +323,25 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     status_text = st.empty()
 
     for i, stop in enumerate(stops_list):
-        status_text.text(f"Geocoding {i + 1}/{len(stops_list)}: {stop['company']}...")
-        coords = get_coordinates(stop["address"])
-        time_module.sleep(0.5)
+        # Determine whether to search by Address OR Company Name
+        address_val = str(stop["address"]).strip()
+        if not address_val or address_val.lower() in {"nan", "-", "none", ""}:
+            status_text.text(f"Searching Company '{stop['company']}' via Live Geocoder...")
+            search_query = f"{stop['company']}, Penang, Malaysia"
+        else:
+            status_text.text(f"Fetching Live Postcode & GPS for {stop['company']}...")
+            search_query = f"{address_val}, Penang, Malaysia"
+            
+        lon, lat, fetched_postcode = fetch_location_and_postcode(search_query)
+        time_module.sleep(0.6) # Gentle delay to respect API rate limits
 
-        if coords:
-            stop["coords"] = coords
+        if lat is not None and lon is not None:
+            stop["coords"] = (lon, lat)
+            
+            # OVERRIDE the old grouping if the API found a verified postcode
+            if fetched_postcode:
+                stop["area"] = fetched_postcode
+                
             valid_stops.append(stop)
         else:
             unmapped_stops.append(stop)
@@ -300,14 +354,14 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     if not valid_stops:
         return unmapped_stops
 
-    # 1. Group strictly by zone/postcode cluster key
+    # 1. Group strictly by the NEWLY FETCHED zone/postcode cluster key
     areas_dict = {}
     for stop in valid_stops:
         areas_dict.setdefault(stop["area"], []).append(stop)
 
     area_names = list(areas_dict.keys())
 
-    # 2. Compute centroids for each zone cluster to sequence blocks smoothly from start point
+    # 2. Compute centroids for each zone cluster
     area_centroids = {}
     for area_name, cluster_stops in areas_dict.items():
         lon_sum = sum(stop["coords"][0] for stop in cluster_stops)
@@ -318,7 +372,7 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     status_text = st.empty()
     status_text.text("Sequencing strict zone blocks from start to end...")
 
-    # 3. Order zone blocks via nearest neighbor from current position so blocks flow logically
+    # 3. Order zone blocks via nearest neighbor
     remaining_areas = list(area_names)
     ordered_areas = []
     current_pos = start_coords
@@ -334,14 +388,13 @@ def optimize_route_osrm(stops_list, start_key, end_key):
 
     status_text.empty()
 
-    # 4. Build final sequence: Fully exhaust each zone block before locking and moving to the next
+    # 4. Build final sequence: Fully exhaust each zone block before locking and moving on
     final_optimized_stops = []
     current_position = start_coords
 
     for area_name in ordered_areas:
         cluster_stops = list(areas_dict[area_name])
         
-        # Sort stops within this zone using a tight nearest-neighbor chain
         ordered_cluster = []
         while cluster_stops:
             nearest_stop = min(
@@ -470,7 +523,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("Locking zone blocks and building route..."):
+            with st.spinner("Executing Web Search, Fetching Postcodes, and Locking Route..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
