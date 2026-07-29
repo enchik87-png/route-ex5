@@ -30,29 +30,30 @@ PRESET_LOCATIONS = {
     "Taman Sri Serdang, Bertam (Home)": "🏠 Taman Sri Serdang, Bertam, Kepala Batas",
 }
 
-# --- PENANG POSTCODE & START GPS COORDINATES LOOKUP ---
+# --- PENANG MAINLAND POSTCODE GPS (Strict South-to-North Latitudes per MyPostcode.my) ---
 PENANG_POSTCODE_GPS = {
-    "13200": (5.515, 100.430),  # Kepala Batas / Bertam
-    "13300": (5.480, 100.480),  # Tasek Gelugor
-    "13800": (5.445, 100.430),  # Sungai Dua / Kg Teluk / Lokan
+    "14300": (5.170, 100.480),  # Nibong Tebal (Southmost)
+    "14200": (5.220, 100.490),  # Sungai Bakap
+    "14400": (5.200, 100.500),  # Valdor
+    "14110": (5.250, 100.440),  # Batu Kawan / Bandar Cassia
+    "14120": (5.280, 100.480),  # Simpang Ampat (Villa Begonia / Hijauan Hills)
+    "14100": (5.300, 100.450),  # Simpang Ampat / Bukit Minyak / Tambun
+    "14000": (5.350, 100.460),  # Bukit Mertajam / Juru / Permatang Tinggi
+    "13600": (5.360, 100.390),  # Perai / Kawasan Perusahaan Perai
+    "13500": (5.372, 100.410),  # Permatang Pauh / Taman Pauh Jaya
+    "13700": (5.390, 100.400),  # Seberang Jaya
     "13000": (5.412, 100.370),  # Butterworth
     "13020": (5.418, 100.380),  # Butterworth / Selayang Indah
-    "13400": (5.420, 100.380),  # Butterworth / Bagan
-    "13500": (5.372, 100.410),  # Permatang Pauh / Elevate
-    "13700": (5.390, 100.400),  # Seberang Jaya
-    "13600": (5.360, 100.390),  # Perai / Prai
-    "14000": (5.350, 100.460),  # Bukit Mertajam / Juru / Permatang Tinggi
-    "14100": (5.300, 100.450),  # Simpang Ampat / Bukit Minyak / Tambun
-    "14120": (5.280, 100.480),  # Simpang Ampat / Villa Begonia / Hijauan Hills
-    "14200": (5.220, 100.490),  # Sungai Bakap
-    "14300": (5.170, 100.480),  # Nibong Tebal
-    "14400": (5.200, 100.500),  # Valdor
+    "13400": (5.420, 100.380),  # Butterworth / Bagan / Mak Mandin
+    "13800": (5.445, 100.430),  # Sungai Dua / Kampung Teluk
+    "13300": (5.480, 100.480),  # Tasek Gelugor
+    "13200": (5.515, 100.430),  # Kepala Batas / Bertam (Northmost)
 }
 
 PRESET_COORDS = {
-    "Kalyx Consultants Sdn Bhd (Office)": (5.343, 100.433),  # Icon City, Bukit Mertajam
-    "Machang Bubok (Home)": (5.338, 100.508),               # Machang Bubok
-    "Taman Sri Serdang, Bertam (Home)": (5.518, 100.440)    # Bertam, Kepala Batas
+    "Kalyx Consultants Sdn Bhd (Office)": (5.343, 100.433),
+    "Machang Bubok (Home)": (5.338, 100.508),
+    "Taman Sri Serdang, Bertam (Home)": (5.518, 100.440)
 }
 
 
@@ -247,7 +248,7 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. GPS NEAREST-NEIGHBOR ROUTE OPTIMIZATION ---
+# --- 5. SOUTH-TO-NORTH DIRECTIONAL SWEEP ROUTE OPTIMIZATION ---
 def get_stop_coords(stop):
     """Extracts 5-digit postcode (1xxxx) from address and maps to coordinates."""
     combined_text = f"{stop.get('area', '')} {stop.get('address', '')}"
@@ -256,38 +257,25 @@ def get_stop_coords(stop):
         pc = match.group(1)
         if pc in PENANG_POSTCODE_GPS:
             return PENANG_POSTCODE_GPS[pc]
-    return (5.350, 100.450)  # Default fallback fallback centroid (BM)
-
-def haversine_distance(coord1, coord2):
-    """Calculates straight-line grid distance between two GPS points."""
-    lat1, lon1 = coord1
-    lat2, lon2 = coord2
-    return math.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2)
+    return (5.350, 100.450)  # Default fallback centroid (BM)
 
 def optimize_route_with_gemini(stops_list, start_key, end_key):
-    """Deterministically links stops using nearest-neighbor routing
+    """Deterministically sorts stops in a strict South-to-North direction
 
-    starting from the chosen Start Point to completely prevent zig-zagging.
+    (Nibong Tebal 14300 -> Simpang Ampat 141xx -> Bukit Minyak/Juru 140xx -> Perai 13600 -> Permatang Pauh 13500 -> Butterworth 130xx)
+    to completely eliminate zig-zagging.
     """
     if not stops_list:
         return []
 
-    start_coords = PRESET_COORDS.get(start_key, (5.343, 100.433))
-    unvisited = stops_list.copy()
-    optimized = []
-    
-    current_pos = start_coords
+    # Sort stops strictly by latitude ascending (South to North: lowest latitude first)
+    # Secondary sort alphabetically by company name for clean alphabetical grouping within the same postcode.
+    sorted_stops = sorted(
+        stops_list, 
+        key=lambda s: (get_stop_coords(s)[0], s.get("company", ""))
+    )
 
-    while unvisited:
-        closest_stop = min(
-            unvisited, 
-            key=lambda s: haversine_distance(current_pos, get_stop_coords(s))
-        )
-        optimized.append(closest_stop)
-        current_pos = get_stop_coords(closest_stop)
-        unvisited.remove(closest_stop)
-
-    return optimized
+    return sorted_stops
 
 
 # --- 6. UI PAGE: SETUP & TASK SELECTION ---
@@ -403,7 +391,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
 
-            with st.spinner("⚡ Processing GPS nearest-neighbor routing..."):
+            with st.spinner("⚡ Processing South-to-North sweep routing..."):
                 st.session_state.optimized_route = optimize_route_with_gemini(selected_stops, sel_start, sel_end)
 
             st.session_state.page = "preview"
