@@ -1,4 +1,5 @@
 import io
+import re
 import time as time_module
 import urllib.parse
 from datetime import datetime, timedelta, time
@@ -95,6 +96,28 @@ def calculate_kpi_status(raw_request_date):
     return days_elapsed, status_key, badge_html, is_red, formatted_req_str
 
 
+# --- POSTCODE & AREA CLUSTERING HELPER ---
+def get_cluster_key(raw_area, address):
+    address_str = str(address)
+    combined_text = f"{raw_area} {address_str}".lower()
+    
+    # 1. Force unify Permatang Tinggi & Taman Industri Teguh variants together
+    if "permatang tinggi" in combined_text or "taman industri teguh" in combined_text:
+        return "Permatang Tinggi / Taman Industri Teguh"
+
+    # 2. Extract 5-digit Malaysian Postcode from address
+    postcode_match = re.search(r'\b(\d{5})\b', address_str)
+    if postcode_match:
+        postcode = postcode_match.group(1)
+        return f"Postcode {postcode}"
+    
+    # 3. Fallback to normalized area name column if no postcode found
+    cleaned = str(raw_area).strip().title()
+    if not cleaned or cleaned == "Nan":
+        return "Unassigned"
+    return cleaned
+
+
 # --- 3. DATA LOADING LOGIC ---
 @st.cache_data(ttl=30, show_spinner=False)
 def load_pending_despatch_tasks():
@@ -140,6 +163,9 @@ def load_pending_despatch_tasks():
             if company and address and str(address).strip() != "nan":
                 days_elapsed, kpi_status, badge_html, is_red, formatted_req_str = calculate_kpi_status(cell_date)
 
+                raw_area = str(sheet.cell(row=row_idx, column=14).value or "Unassigned")
+                cluster_group = get_cluster_key(raw_area, str(address))
+
                 pending_tasks.append({
                     "id": row_idx,
                     "requested_date_raw": cell_date,
@@ -150,7 +176,7 @@ def load_pending_despatch_tasks():
                     "is_red_overdue": is_red,
                     "pic_name": str(sheet.cell(row=row_idx, column=5).value or "-"),
                     "task_type": str(sheet.cell(row=row_idx, column=6).value or "Despatch"),
-                    "area": str(sheet.cell(row=row_idx, column=14).value or "Unassigned"),
+                    "area": cluster_group,
                     "box": float(sheet.cell(row=row_idx, column=16).value or 0),
                     "company": str(company),
                     "address": str(address),
@@ -188,7 +214,7 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. GPS GEOCODING & AREA-CLUSTERED ROUTE OPTIMIZATION ---
+# --- 5. GPS GEOCODING & STRICT CLUSTERED ROUTE OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_coordinates(address):
     search_query = f"{address}, Penang, Malaysia"
@@ -245,17 +271,15 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     if not valid_stops:
         return unmapped_stops
 
-    # --- STEP 1: GROUP STOPS BY AREA ---
+    # --- STEP 1: GROUP STOPS STRICTLY BY POSTCODE / CLUSTER KEY ---
     areas_dict = {}
     for stop in valid_stops:
-        area_name = str(stop.get("area", "Unassigned")).strip()
-        if not area_name or area_name.lower() == "nan":
-            area_name = "Unassigned"
-        if area_name not in areas_dict:
-            areas_dict[area_name] = []
-        areas_dict[area_name].append(stop)
+        cluster_name = stop["area"]
+        if cluster_name not in areas_dict:
+            areas_dict[cluster_name] = []
+        areas_dict[cluster_name].append(stop)
 
-    # --- STEP 2: CALCULATE AREA CENTROIDS & ORDER AREAS LOGICALLY ---
+    # --- STEP 2: CALCULATE CLUSTER CENTROIDS & SEQUENCE BLOCKS ---
     area_names = list(areas_dict.keys())
     area_centroids = {}
     for area_name, stops in areas_dict.items():
@@ -265,9 +289,8 @@ def optimize_route_osrm(stops_list, start_key, end_key):
         area_centroids[area_name] = (lon_sum / count, lat_sum / count)
 
     if len(area_names) > 1:
-        # Build area routing matrix: [Start] + [Area Centroids...] + [End]
         area_coords_list = [start_coords] + [area_centroids[a] for a in area_names] + [end_coords]
-        status_text.text("Clustering areas and sequencing route flow...")
+        status_text.text("Sequencing postcode clusters...")
         matrix = get_osrm_matrix(area_coords_list)
         status_text.empty()
 
@@ -307,52 +330,25 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     else:
         ordered_areas = area_names
 
-    # --- STEP 3: OPTIMIZE STOPS WITHIN EACH AREA CLUSTER ---
+    # --- STEP 3: ASSEMBLE STOPS BLOCK BY BLOCK (ZERO INTERLEAVING) ---
     final_optimized_stops = []
     for area_name in ordered_areas:
         cluster_stops = areas_dict[area_name]
-        if len(cluster_stops) <= 1:
-            final_optimized_stops.extend(cluster_stops)
-            continue
-
-        sub_coords = [s["coords"] for s in cluster_stops]
-        sub_matrix = get_osrm_matrix(sub_coords)
         
-        if sub_matrix and len(cluster_stops) > 2:
-            n_sub = len(cluster_stops)
-            sub_manager = pywrapcp.RoutingIndexManager(n_sub, 1, 0, n_sub - 1)
-            sub_routing = pywrapcp.RoutingModel(sub_manager)
-
-            def sub_cb(f, t):
-                return int(sub_matrix[sub_manager.IndexToNode(f)][sub_manager.IndexToNode(t)])
-
-            sub_transit = sub_routing.RegisterTransitCallback(sub_cb)
-            sub_routing.SetArcCostEvaluatorOfAllVehicles(sub_transit)
-
-            sub_params = pywrapcp.DefaultRoutingSearchParameters()
-            sub_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            sub_params.time_limit.seconds = 1
-
-            sub_sol = sub_routing.SolveWithParameters(sub_params)
-            if sub_sol:
-                sub_ordered = []
-                s_idx = sub_routing.Start(0)
-                s_idx = sub_sol.Value(sub_routing.NextVar(s_idx))
-                while not sub_routing.IsEnd(s_idx):
-                    n_idx = sub_manager.IndexToNode(s_idx)
-                    sub_ordered.append(cluster_stops[n_idx])
-                    s_idx = sub_sol.Value(sub_routing.NextVar(s_idx))
-                
-                # Ensure all cluster stops are included
-                included_ids = {s["id"] for s in sub_ordered}
-                for s in cluster_stops:
-                    if s["id"] not in included_ids:
-                        sub_ordered.append(s)
-                final_optimized_stops.extend(sub_ordered)
-            else:
-                final_optimized_stops.extend(cluster_stops)
-        else:
-            final_optimized_stops.extend(cluster_stops)
+        sorted_cluster = []
+        remaining = list(cluster_stops)
+        curr_ref = start_coords if not final_optimized_stops else final_optimized_stops[-1]["coords"]
+        
+        while remaining:
+            closest_stop = min(
+                remaining, 
+                key=lambda s: ((s["coords"][0] - curr_ref[0])**2 + (s["coords"][1] - curr_ref[1])**2)
+            )
+            sorted_cluster.append(closest_stop)
+            curr_ref = closest_stop["coords"]
+            remaining.remove(closest_stop)
+            
+        final_optimized_stops.extend(sorted_cluster)
 
     return final_optimized_stops + unmapped_stops
 
@@ -376,14 +372,14 @@ if st.session_state.page == "setup":
     
     col_f1, col_f2, col_f3 = st.columns(3)
     with col_f1:
-        selected_area = st.selectbox("📍 Filter Area:", ["All Areas"] + list(df_tasks["area"].unique()))
+        selected_area = st.selectbox("📍 Filter Zone/Postcode:", ["All Zones"] + list(df_tasks["area"].unique()))
     with col_f2:
         selected_transport = st.selectbox("🚗/🏍️ Transport:", ["All", "Car", "Motorcycle"])
     with col_f3:
         selected_kpi = st.selectbox("⏳ KPI Filter:", ["All Tasks", "🚨 Overdue Only", "⚠️ Due Today (Day 2)", "✅ On Time Only"])
 
     filtered_df = df_tasks
-    if selected_area != "All Areas":
+    if selected_area != "All Zones":
         filtered_df = filtered_df[filtered_df["area"] == selected_area]
     if selected_transport != "All":
         filtered_df = filtered_df[filtered_df["transport"].str.contains(selected_transport, case=False)]
@@ -455,7 +451,7 @@ if st.session_state.page == "setup":
     with col_ep:
         sel_end = st.selectbox("🏁 End Point:", options_keys, index=0, key="select_end_pt")
 
-    if st.button("🚀 Calculate Area-Clustered Route", type="primary", use_container_width=True):
+    if st.button("🚀 Calculate Postcode-Clustered Route", type="primary", use_container_width=True):
         if not selected_stops:
             st.warning("Please select at least one task.")
         else:
@@ -463,7 +459,7 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            with st.spinner("Clustering areas and optimizing flow..."):
+            with st.spinner("Clustering by postcode and ordering blocks..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
             
             st.session_state.page = "preview"
@@ -473,7 +469,7 @@ if st.session_state.page == "setup":
 # --- 7. UI PAGE: ROUTE PREVIEW & MANUAL ADJUSTMENT ---
 elif st.session_state.page == "preview":
     st.title("🗺️ Route Preview & Reordering")
-    st.caption("Review your area-clustered route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed.")
+    st.caption("Review your postcode-clustered route below. Use the ⬆️ and ⬇️ buttons to manually adjust stops if needed.")
     
     start_label = PRESET_LOCATIONS.get(st.session_state.start_point, {}).get("label", st.session_state.start_point)
     end_label = PRESET_LOCATIONS.get(st.session_state.end_point, {}).get("label", st.session_state.end_point)
@@ -559,7 +555,7 @@ elif st.session_state.page == "route":
     st.markdown(f"**Task:** {stop['task_type']} {transport_icon} | {time_badge}")
     st.markdown(f"📅 **Requested Date:** {stop['requested_date_str']}")
     st.markdown(f"🏢 **Dept:** {stop['department']} | 👤 **Kalyx PIC:** {stop['pic_name']}")
-    st.markdown(f"📍 **Area:** {stop['area']} | **Address:** {stop['address']}")
+    st.markdown(f"📍 **Zone/Postcode:** {stop['area']} | **Address:** {stop['address']}")
     
     items = []
     if stop["box"] > 0: items.append(f"📦 {int(stop['box'])} Box")
