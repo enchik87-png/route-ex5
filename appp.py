@@ -188,7 +188,7 @@ def mark_row_completed_in_sheets(row_idx):
         return False
 
 
-# --- 5. GPS GEOCODING & OR-TOOLS OPTIMIZATION ---
+# --- 5. GPS GEOCODING & ADVANCED OR-TOOLS OPTIMIZATION ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_coordinates(address):
     search_query = f"{address}, Penang, Malaysia"
@@ -247,7 +247,7 @@ def optimize_route_osrm(stops_list, start_key, end_key):
 
     all_coords = [start_coords] + [s["coords"] for s in valid_stops] + [end_coords]
     
-    status_text.text("Calculating Penang road traffic routes...")
+    status_text.text("Calculating optimal Penang traffic road routes...")
     time_matrix = get_osrm_matrix(all_coords)
     status_text.empty()
     
@@ -270,8 +270,15 @@ def optimize_route_osrm(stops_list, start_key, end_key):
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
+    # --- ADVANCED GLOBAL OPTIMIZATION PARAMETERS ---
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    )
+    search_parameters.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    search_parameters.time_limit.seconds = 3
 
     solution = routing.SolveWithParameters(search_parameters)
 
@@ -396,10 +403,9 @@ if st.session_state.page == "setup":
             st.session_state.start_point = sel_start
             st.session_state.end_point = sel_end
             
-            with st.spinner("Analyzing maps and traffic constraints..."):
+            with st.spinner("Analyzing maps and optimizing clusters..."):
                 st.session_state.optimized_route = optimize_route_osrm(selected_stops, sel_start, sel_end)
             
-            # Go to preview page instead of direct route execution
             st.session_state.page = "preview"
             st.rerun()
 
